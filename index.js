@@ -251,7 +251,7 @@ function buildAnnouncement({type, lang, title, when, details}){
   if (when) lines.push(`🗓 ${when}`);
   if (details) { lines.push(''); lines.push(details); }
   return lines.join('
-');
+');');
 }
 
 // ========= Discord Client =========
@@ -356,4 +356,4 @@ client.on('interactionCreate', async (interaction) => {
       const msg = interaction.options.getString('message', true);
       const lang = detectLang(msg, interaction.user.id);
       const system = lang==='pl'
-        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SG
+        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord
