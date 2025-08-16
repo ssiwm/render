@@ -79,8 +79,7 @@ const LOG_FILE = path.join(LOG_DIR, 'usage.csv');
 function ensureLogSetup(){
   try {
     if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR);
-    const header = 'ts,guildId,channelId,userId,command,model,promptTokens,completionTokens,totalTokens,elevated,globalUsed,userUsed,userProUsed
-';
+    const header = 'ts,guildId,channelId,userId,command,model,promptTokens,completionTokens,totalTokens,elevated,globalUsed,userUsed,userProUsed\n';
     if (!fs.existsSync(LOG_FILE)) fs.writeFileSync(LOG_FILE, header);
   } catch(e){ console.error('log setup', e); }
 }
@@ -130,8 +129,7 @@ async function logUsage({ client, ctx, command, model, usage, elevated }){
   const userId = ctx.user?.id || ctx.author?.id || '';
   const e = userDaily.get(userId) || { used:0, usedPro:0 };
   const row = [ts,guildId,channelId,userId,command,model,usage?.prompt_tokens||'',usage?.completion_tokens||'',usage?.total_tokens||'',elevated?'1':'0',globalUsed,e.used,e.usedPro].map(csv).join(',');
-  try { fs.appendFileSync(LOG_FILE, row+'
-'); } catch(err){ console.error('csv write', err); }
+  try { fs.appendFileSync(LOG_FILE, row+'\n'); } catch(err){ console.error('csv write', err); }
   appendSheet([ts,guildId,channelId,userId,command,model,usage?.prompt_tokens||'',usage?.completion_tokens||'',usage?.total_tokens||'', elevated?1:0, globalUsed, e.used, e.usedPro]);
   logToChannel(client, `🧾 **Log** ${command} by <@${userId}> | model ${model} | tokens: ${usage?.total_tokens ?? '?'} | global ${globalUsed}/${LIMITS.GLOBAL_PER_DAY}`);
 }
@@ -214,8 +212,7 @@ async function buildStatusSummary(){
     else lines.push(`❌ ${icon} **${d.name}** — HTTP ${r.status ?? 'error'}`);
     lastStatus.set(`http:${d.name}`, r.ok);
   }
-  return lines.join('
-');
+  return lines.join('\n');
 }
 async function startAutoStatus(){
   const chanId = process.env.STATUS_CHANNEL_ID;
@@ -253,8 +250,7 @@ function buildAnnouncement({type, lang, title, when, details}){
   }
   if (when) lines.push(`🗓 ${when}`);
   if (details) { lines.push(''); lines.push(details); }
-  return lines.join('
-');
+  return lines.join('\n');
 }
 
 // ========= Discord Client =========
@@ -323,8 +319,7 @@ client.on('interactionCreate', async (interaction) => {
       if (hasProRole) lines.push(`Your /ask-pro left: **${remPro}/${LIMITS.ELEVATED_PER_DAY}**`);
       if (isOwnerHelper) lines.push('(Helper bypass active)');
 
-      const msg = lines.join('
-');
+      const msg = lines.join('\n');
       return interaction.reply({ content: msg, ephemeral: true });
     }
 
@@ -361,4 +356,4 @@ client.on('interactionCreate', async (interaction) => {
       const lang = detectLang(msg, interaction.user.id);
       const system = lang==='pl'
         ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SGServers. Odpowiadaj szczegółowo i precyzyjnie po polsku.' : 'Jesteś Lumenem, pomocnym asystentem Discord SGServers. Odpowiadaj krótko, po polsku, rzeczowo i przyjaźnie.')
-        : (isPro ? 'You are Lume
+        : (isPro ? 'You are
