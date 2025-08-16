@@ -45,9 +45,11 @@ const LOG_FILE = path.join(LOG_DIR, 'usage.csv');
 function ensureLogSetup(){
   try {
     if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR);
-    if (!fs.existsSync(LOG_FILE)) fs.writeFileSync(LOG_FILE, 'ts,guildId,channelId,userId,command,model,promptTokens,completionTokens,totalTokens,elevated,globalUsed,userUsed,userProUsed
-');
+    const header = 'ts,guildId,channelId,userId,command,model,promptTokens,completionTokens,totalTokens,elevated,globalUsed,userUsed,userProUsed
+';
+    if (!fs.existsSync(LOG_FILE)) fs.writeFileSync(LOG_FILE, header);
   } catch(e){ console.error('log setup', e); }
+} catch(e){ console.error('log setup', e); }
 }
 ensureLogSetup();
 function csv(val){ if (val==null) return '""'; const s=String(val).replaceAll('"','""'); return '"'+s+'"'; }
@@ -94,6 +96,12 @@ async function logUsage({ client, ctx, command, model, usage, elevated }){
   const channelId = ctx.channel?.id || ctx.channelId || '';
   const userId = ctx.user?.id || ctx.author?.id || '';
   const e = userDaily.get(userId) || { used:0, usedPro:0 };
+  const row = [ts,guildId,channelId,userId,command,model,usage?.prompt_tokens||'',usage?.completion_tokens||'',usage?.total_tokens||'',elevated?'1':'0',globalUsed,e.used,e.usedPro].map(csv).join(',');
+  try { fs.appendFileSync(LOG_FILE, row+'
+'); } catch(err){ console.error('csv write', err); }
+  appendSheet([ts,guildId,channelId,userId,command,model,usage?.prompt_tokens||'',usage?.completion_tokens||'',usage?.total_tokens||'', elevated?1:0, globalUsed, e.used, e.usedPro]);
+  logToChannel(client, `🧾 **Log** ${command} by <@${userId}> | model ${model} | tokens: ${usage?.total_tokens ?? '?'} | global ${globalUsed}/${LIMITS.GLOBAL_PER_DAY}`);
+};
   const row = [ts,guildId,channelId,userId,command,model,usage?.prompt_tokens||'',usage?.completion_tokens||'',usage?.total_tokens||'',elevated?'1':'0',globalUsed,e.used,e.usedPro].map(csv).join(',');
   try { fs.appendFileSync(LOG_FILE, row+'
 '); } catch(err){ console.error('csv write', err); }
@@ -308,6 +316,22 @@ async function buildStatusSummary(){
   }
   return lines.join('
 ');
+}** — invalid host/port`); continue; }
+    const r = await queryGame(d.type || 'arkse', d.host, d.port);
+    const icon = iconForType(d.type || 'arkse');
+    if (r.ok) lines.push(`✅ ${icon} **${d.name}** — ${r.players}/${r.max} players, ping ${r.ping}ms`);
+    else lines.push(`❌ ${icon} **${d.name}** — offline`);
+    lastStatus.set(`game:${d.type}:${d.name}`, r.ok);
+  }
+  for (const d of httpDefs){
+    const r = await queryHttp(d.value);
+    const icon = iconForHttp(d.name);
+    if (r.ok) lines.push(`✅ ${icon} **${d.name}** — HTTP ${r.status}`);
+    else lines.push(`❌ ${icon} **${d.name}** — HTTP ${r.status ?? 'error'}`);
+    lastStatus.set(`http:${d.name}`, r.ok);
+  }
+  return lines.join('
+');
 }
 async function startAutoStatus(){
   const chanId = process.env.STATUS_CHANNEL_ID;
@@ -363,23 +387,4 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'announce'){
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-      if (!userHasAnnouncePerm(member)) return interaction.reply({ content: '⛔ Brak uprawnień do ogłoszeń.', ephemeral: true });
-      const type = interaction.options.getString('type', true);
-      const lang = interaction.options.getString('lang', true);
-      const title = interaction.options.getString('title', true);
-      const when = interaction.options.getString('when');
-      const details = interaction.options.getString('details');
-      const channel = interaction.options.getChannel('channel') || (process.env.ANNOUNCE_CHANNEL_ID ? await interaction.client.channels.fetch(process.env.ANNOUNCE_CHANNEL_ID) : interaction.channel);
-      const content = buildAnnouncement({ type, lang, title, when, details });
-      await channel.send({ content });
-      return interaction.reply({ content: '✅ Ogłoszenie wysłane.', ephemeral: true });
-    }
-
-    if (interaction.commandName === 'ask' || interaction.commandName === 'ask-pro'){
-      const isPro = interaction.commandName === 'ask-pro';
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-      const hasProRole = member.roles.cache.some(r=>ALLOWED_PRO_ROLES.includes(r.name));
-      const isOwnerHelper = member.roles.cache.some(r=>r.name==='Helper') && interaction.user.id===OWNER_ID;
-      if (isPro && !hasProRole && !isOwnerHelper){
-        return interaction.reply({ content: '
+      const member = await in
