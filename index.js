@@ -360,4 +360,5 @@ client.on('interactionCreate', async (interaction) => {
       const msg = interaction.options.getString('message', true);
       const lang = detectLang(msg, interaction.user.id);
       const system = lang==='pl'
-        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SGServers. Odpowiadaj szczegółowo i precyzyjnie po polsku.' : 'Jesteś Lumenem, pomocnym asystentem Discord SGServers. Odpowiadaj krótko, po polsku, rzeczowo 
+        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SGServers. Odpowiadaj szczegółowo i precyzyjnie po polsku.' : 'Jesteś Lumenem, pomocnym asystentem Discord SGServers. Odpowiadaj krótko, po polsku, rzeczowo i przyjaźnie.')
+        : (isPro ? 'You are Lume
