@@ -12,6 +12,7 @@ services:
       - key: OPENAI_API_KEY
         fromSecret: OPENAI_API_KEY
       - key: OWNER_DISCORD_ID
-        value: "123456789012345678"    # wstaw swój Discord ID lub użyj fromSecret
+        value: "858126280116535297"    # wstaw swój Discord ID lub użyj fromSecret
       - key: REPORTS_CHANNEL_ID
-        value: "000000000000000000"   # ID kanału #reports (opcjonalnie)
+
+        value: "1401655560541311016"   # ID kanału #reports (opcjonalnie)
