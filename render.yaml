@@ -1,0 +1,17 @@
+services:
+  - type: worker              # długotrwały proces, idealny dla bota Discord
+    name: sgservers-discord-bot
+    env: node
+    plan: free                # darmowy plan (możesz zmienić na starter/paid)
+    autoDeploy: true
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        fromSecret: DISCORD_BOT_TOKEN
+      - key: OPENAI_API_KEY
+        fromSecret: OPENAI_API_KEY
+      - key: OWNER_DISCORD_ID
+        value: "123456789012345678"    # wstaw swój Discord ID lub użyj fromSecret
+      - key: REPORTS_CHANNEL_ID
+        value: "000000000000000000"   # ID kanału #reports (opcjonalnie)
