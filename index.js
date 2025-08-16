@@ -4,7 +4,7 @@ import OpenAI from 'openai';
 import express from 'express';
 
 // ========= Config =========
-const ALLOWED_PRO_ROLES = ['admin', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
+const ALLOWED_PRO_ROLES = ['admini', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
 const OWNER_ID = process.env.OWNER_DISCORD_ID || '';
 const MODELS = { ASK: 'gpt-4o-mini', PRO: 'gpt-4o' };
 const LIMITS = { GLOBAL_PER_DAY: 50, USER_PER_DAY: 5, ELEVATED_PER_DAY: 20 };
@@ -112,7 +112,6 @@ client.on('interactionCreate', async (interaction) => {
       const remPro = hasProRole ? remainingFor(interaction.user.id, true) : 0;
       const remGlobal = Math.max(0, LIMITS.GLOBAL_PER_DAY - globalUsed);
 
-      // Bezpieczne budowanie wiadomości (bez backticków w backtickach)
       const lines = [
         `Global left: **${remGlobal}/${LIMITS.GLOBAL_PER_DAY}**`,
         `Your /ask left: **${remUser}/${LIMITS.USER_PER_DAY}**`,
@@ -241,3 +240,4 @@ if (PORT){
   const app = express();
   app.get('/', (_,res)=>res.send('SGServers Discord bot is running.'));
   app.listen(PORT, ()=>console.log('HTTP health on', PORT));
+}
