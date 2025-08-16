@@ -16,8 +16,7 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { google } from 'googleapis';
-import Gamedig from 'gamedig';
-
+import * as Gamedig from 'gamedig';
 /*
  * SGServers Discord Bot
  *
