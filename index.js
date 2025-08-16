@@ -237,31 +237,73 @@ function parsePairs(env){
     return { name: name?.trim()||rest, value: rest?.trim()||'' };
   });
 }
-async function queryArk(host, port){
-  try { const r = await Gamedig.query({ type: 'arkse', host, port: Number(port) });
-    return { ok:true, name:r.name, map:r.map, players:r.players?.length||0, max:r.maxplayers||0, ping:r.ping };
+// New: parse server pairs with optional attributes: host:port;type=scum
+function parseServerPairs(env){
+  if (!env) return [];
+  return env.split(',').map(s=>s.trim()).filter(Boolean).map(p=>{
+    const [nameRaw, restRaw] = p.split('|');
+    const name = (nameRaw||'').trim();
+    let right = (restRaw||'').trim();
+    let type = 'arkse';
+    if (right.includes(';')){
+      const parts = right.split(';').map(x=>x.trim()).filter(Boolean);
+      right = parts[0];
+      for (let i=1;i<parts.length;i++){
+        const [k,v] = parts[i].split('=');
+        if ((k||'').trim().toLowerCase()==='type' && v) type = v.trim();
+      }
+    }
+    const [host, portStr] = right.split(':');
+    const port = Number(portStr);
+    return { name: name||right, host: (host||'').trim(), port, type };
+  });
+}
+async function queryGame(type, host, port){
+  try {
+    const r = await Gamedig.query({ type, host, port: Number(port) });
+    const playerCount = Array.isArray(r.players) ? r.players.length : (r.players || 0);
+    return { ok:true, name:r.name, map:r.map, players:playerCount, max:r.maxplayers||0, ping:r.ping };
   } catch(e){ return { ok:false, error:String(e.message||e) }; }
 }
+// Backwards compatibility: ark (ASE/ASA) without type
+async function queryArk(host, port){
+  return queryGame('arkse', host, port);
+}
 async function queryHttp(url){
-  try { const res = await fetch(url, { method:'GET' }); return { ok: res.ok, status: res.status };
+  try {
+    const res = await fetch(url, { method:'GET' });
+    // Treat 2xx and 3xx (redirects) as OK for simple website pings
+    const ok = res.status >= 200 && res.status < 400;
+    return { ok, status: res.status };
   } catch(e){ return { ok:false, error:String(e.message||e) }; }
 }
 const lastStatus = new Map();
+function iconForType(type){
+  const t = (type||'').toLowerCase();
+  if (t==='scum') return '🎯';
+  if (t==='arkse') return '🦖';
+  return '🎮';
+}
+function iconForHttp(name){
+  return '🌐';
+}
 async function buildStatusSummary(){
-  const arkDefs = parsePairs(process.env.STATUS_SERVERS);
+  const serverDefs = parseServerPairs(process.env.STATUS_SERVERS);
   const httpDefs = parsePairs(process.env.STATUS_HTTP_URLS);
   const lines = [];
-  for (const d of arkDefs){
-    const [host,port] = d.value.split(':');
-    const r = await queryArk(host, port);
-    if (r.ok) lines.push(`✅ **${d.name}** — ${r.players}/${r.max} players, ping ${r.ping}ms`);
-    else lines.push(`❌ **${d.name}** — offline`);
-    lastStatus.set(`ark:${d.name}`, r.ok);
+  for (const d of serverDefs){
+    if (!d.host || !d.port) { lines.push(`❔ **${d.name}** — invalid host/port`); continue; }
+    const r = await queryGame(d.type || 'arkse', d.host, d.port);
+    const icon = iconForType(d.type || 'arkse');
+    if (r.ok) lines.push(`✅ ${icon} **${d.name}** — ${r.players}/${r.max} players, ping ${r.ping}ms`);
+    else lines.push(`❌ ${icon} **${d.name}** — offline`);
+    lastStatus.set(`game:${d.type}:${d.name}`, r.ok);
   }
   for (const d of httpDefs){
     const r = await queryHttp(d.value);
-    if (r.ok) lines.push(`✅ **${d.name}** — HTTP ${r.status}`);
-    else lines.push(`❌ **${d.name}** — HTTP error`);
+    const icon = iconForHttp(d.name);
+    if (r.ok) lines.push(`✅ ${icon} **${d.name}** — HTTP ${r.status}`);
+    else lines.push(`❌ ${icon} **${d.name}** — HTTP ${r.status ?? 'error'}`);
     lastStatus.set(`http:${d.name}`, r.ok);
   }
   return lines.join('
@@ -340,30 +382,4 @@ client.on('interactionCreate', async (interaction) => {
       const hasProRole = member.roles.cache.some(r=>ALLOWED_PRO_ROLES.includes(r.name));
       const isOwnerHelper = member.roles.cache.some(r=>r.name==='Helper') && interaction.user.id===OWNER_ID;
       if (isPro && !hasProRole && !isOwnerHelper){
-        return interaction.reply({ content: '⛔ Nie masz uprawnień do `/ask-pro`. Użyj `/ask`.', ephemeral: true });
-      }
-
-      const msg = interaction.options.getString('message', true);
-      const lang = detectLang(msg, interaction.user.id);
-      const system = lang==='pl'
-        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SGServers. Odpowiadaj szczegółowo i precyzyjnie po polsku.' : 'Jesteś Lumenem, pomocnym asystentem Discord SGServers. Odpowiadaj krótko, po polsku, rzeczowo i przyjaźnie.')
-        : (isPro ? 'You are Lumen, a professional Discord helper for SGServers. Provide detailed, accurate answers.' : 'You are Lumen, a friendly Discord helper for SGServers. Keep answers concise, helpful, and game-focused.');
-
-      const gate = canUse(interaction.user.id, isPro, isOwnerHelper);
-      if (!gate.ok){
-        const why = gate.reason==='global' ? `Global limit reached (${LIMITS.GLOBAL_PER_DAY}/day). Try later.` : `Daily limit reached. Use \`/limits\` to check.`;
-        return interaction.reply({ content: `⛔ ${why}`, ephemeral: true });
-      }
-
-      await interaction.deferReply();
-      const model = isPro ? MODELS.PRO : MODELS.ASK;
-
-      let result;
-      try {
-        result = await askLLM(model, system, msg); // { text, usage }
-      } catch (err) {
-        console.error('LLM error', err);
-        const friendly = isBillingInactiveError(err)
-          ? '⚠️ AI jest chwilowo niedostępne (billing OpenAI nieaktywny). Admin już to ogarnia.'
-          : '⚠️ Coś poszło nie tak po stronie AI. Spróbuj ponownie za chwilę.';
-        await safeReply(inter
+        return interaction.reply({ content: '
