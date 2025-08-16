@@ -9,6 +9,20 @@ const OWNER_ID = process.env.OWNER_DISCORD_ID || '';
 const MODELS = { ASK: 'gpt-4o-mini', PRO: 'gpt-4o' };
 const LIMITS = { GLOBAL_PER_DAY: 50, USER_PER_DAY: 5, ELEVATED_PER_DAY: 20 };
 
+// ========= Helpers: błędy i bezpieczne odpowiedzi =========
+function isBillingInactiveError(err) {
+  return err?.code === 'billing_not_active'
+      || err?.error?.code === 'billing_not_active'
+      || (err?.status === 429 && /billing/i.test(err?.error?.message || err?.message || ''));
+}
+async function safeReply(interaction, content, ephemeral = true) {
+  try {
+    if (interaction.deferred)      return interaction.editReply(content);
+    if (interaction.replied)       return interaction.followUp({ content, ephemeral });
+    return interaction.reply({ content, ephemeral });
+  } catch (e) { console.error('safeReply', e); }
+}
+
 // ========= OpenAI =========
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 async function askOpenAI(model, system, user) {
@@ -21,7 +35,7 @@ async function askOpenAI(model, system, user) {
   return r.choices?.[0]?.message?.content?.trim() || 'No response.';
 }
 
-// ========= Limits (in-memory) =========
+// ========= Limity =========
 const userDaily = new Map(); // userId -> { used, usedPro }
 let globalDayKey = new Date().toISOString().slice(0,10);
 let globalUsed = 0;
@@ -55,7 +69,7 @@ function remainingFor(userId, elevated=false){
   return Math.max(0, per - used);
 }
 
-// ========= Language pref =========
+// ========= Język =========
 const userLang = new Map(); // userId -> 'pl' | 'en'
 function detectLang(text, userId){
   const pref = userLang.get(userId);
@@ -119,7 +133,8 @@ client.on('interactionCreate', async (interaction) => {
       if (hasProRole) lines.push(`Your /ask-pro left: **${remPro}/${LIMITS.ELEVATED_PER_DAY}**`);
       if (isOwnerHelper) lines.push('(Helper bypass active)');
 
-      const msg = lines.join('\n');
+      const msg = lines.join('
+');
       return interaction.reply({ content: msg, ephemeral: true });
     }
 
@@ -145,8 +160,21 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       await interaction.deferReply();
-      const model = isPro ? MODELS.PRO : MODELS.ASK;
-      const answer = await askOpenAI(model, system, msg);
+
+      // --- BEZPIECZNY CALL DO OPENAI ---
+      let answer;
+      try {
+        const model = isPro ? MODELS.PRO : MODELS.ASK;
+        answer = await askOpenAI(model, system, msg);
+      } catch (err) {
+        console.error('LLM error', err);
+        const friendly = isBillingInactiveError(err)
+          ? '⚠️ AI jest chwilowo niedostępne (billing OpenAI nieaktywny). Admin już to ogarnia.'
+          : '⚠️ Coś poszło nie tak po stronie AI. Spróbuj ponownie za chwilę.';
+        await safeReply(interaction, friendly, true);
+        return;
+      }
+
       consume(interaction.user.id, isPro, isOwnerHelper);
 
       if (isPro){
@@ -199,14 +227,11 @@ Here’s what we know so far:
     }
   } catch (err) {
     console.error(err);
-    if (interaction.isRepliable()){
-      const msg = 'Coś poszło nie tak. Spróbuj ponownie lub pingnij admina.';
-      interaction.replied ? interaction.followUp({ content: msg, ephemeral: true }) : interaction.reply({ content: msg, ephemeral: true });
-    }
+    await safeReply(interaction, 'Coś poszło nie tak. Spróbuj ponownie lub pingnij admina.', true);
   }
 });
 
-// Mentions (no regex to avoid escapes in templates)
+// Mentions
 client.on('messageCreate', async (msg) => {
   try {
     if (msg.author.bot) return;
@@ -225,7 +250,19 @@ client.on('messageCreate', async (msg) => {
     if (!gate.ok) return msg.reply('⛔ Limit dzienny został osiągnięty. Użyj `/limits`.');
 
     await msg.channel.sendTyping();
-    const answer = await askOpenAI(MODELS.ASK, system, text);
+
+    // --- BEZPIECZNY CALL DO OPENAI ---
+    let answer;
+    try {
+      answer = await askOpenAI(MODELS.ASK, system, text);
+    } catch (err) {
+      console.error('mention LLM error', err);
+      const friendly = isBillingInactiveError(err)
+        ? '⚠️ AI chwilowo niedostępne (billing).'
+        : '⚠️ Błąd po stronie AI.';
+      return msg.reply(friendly);
+    }
+
     consume(msg.author.id, false, false);
     await msg.reply(answer);
   } catch (e) { console.error('mention handler error', e); }
