@@ -30,7 +30,7 @@ import Gamedig from 'gamedig';
  */
 
 // ========= Config =========
-const ALLOWED_PRO_ROLES = ['admini', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
+const ALLOWED_PRO_ROLES = ['admin', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
 const OWNER_ID = process.env.OWNER_DISCORD_ID || '';
 const MODELS = { ASK: 'gpt-4o-mini', PRO: 'gpt-4o' };
 const LIMITS = { GLOBAL_PER_DAY: 50, USER_PER_DAY: 5, ELEVATED_PER_DAY: 20 };
