@@ -16,7 +16,10 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { google } from 'googleapis';
-import Gamedig from 'gamedig';
+// Import the entire gamedig module as a namespace. The CommonJS module does not
+// provide a default export, so using `import * as Gamedig` avoids a runtime
+// SyntaxError in Node ESM.
+import * as Gamedig from 'gamedig';
 
 /*
  * SGServers Discord Bot
@@ -30,7 +33,7 @@ import Gamedig from 'gamedig';
  */
 
 // ========= Config =========
-const ALLOWED_PRO_ROLES = ['admin', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
+const ALLOWED_PRO_ROLES = ['admini', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
 const OWNER_ID = process.env.OWNER_DISCORD_ID || '';
 const MODELS = { ASK: 'gpt-4o-mini', PRO: 'gpt-4o' };
 const LIMITS = { GLOBAL_PER_DAY: 50, USER_PER_DAY: 5, ELEVATED_PER_DAY: 20 };
