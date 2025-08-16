@@ -239,42 +239,19 @@ function userHasAnnouncePerm(member){
   } catch { return false; }
 }
 function buildAnnouncement({type, lang, title, when, details}){
-  const L = (pl,en)=> (lang==='pl'?pl:en);
-  if (type==='event'){
-    return L(
-      `🎉 **Wydarzenie**: ${title}${when?`
-🗓 ${when}`:''}${details?`
-
-${details}`:''}`,
-      `🎉 **Event**: ${title}${when?`
-🗓 ${when}`:''}${details?`
-
-${details}`:''}`
-    );
+  const isPL = lang === 'pl';
+  const lines = [];
+  if (type === 'event') {
+    lines.push(isPL ? `🎉 **Wydarzenie**: ${title}` : `🎉 **Event**: ${title}`);
+  } else if (type === 'restart') {
+    lines.push(isPL ? `🔁 **Restart serwera**: ${title}` : `🔁 **Server restart**: ${title}`);
+  } else {
+    lines.push(isPL ? `🛠 **Aktualizacja**: ${title}` : `🛠 **Update**: ${title}`);
   }
-  if (type==='restart'){
-    return L(
-      `🔁 **Restart serwera**: ${title}${when?`
-🕒 ${when}`:''}${details?`
-
-${details}`:''}`,
-      `🔁 **Server restart**: ${title}${when?`
-🕒 ${when}`:''}${details?`
-
-${details}`:''}`
-    );
-  }
-  // update
-  return L(
-    `🛠 **Aktualizacja**: ${title}${when?`
-🕒 ${when}`:''}${details?`
-
-${details}`:''}`,
-    `🛠 **Update**: ${title}${when?`
-🕒 ${when}`:''}${details?`
-
-${details}`:''}`
-  );
+  if (when) lines.push(`🗓 ${when}`);
+  if (details) { lines.push(''); lines.push(details); }
+  return lines.join('
+');
 }
 
 // ========= Discord Client =========
@@ -376,4 +353,7 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: '⛔ Nie masz uprawnień do `/ask-pro`. Użyj `/ask`.', ephemeral: true });
       }
 
-      const msg = interaction.option
+      const msg = interaction.options.getString('message', true);
+      const lang = detectLang(msg, interaction.user.id);
+      const system = lang==='pl'
+        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SG
