@@ -1,0 +1,14 @@
+{
+  "name": "sgservers-discord-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": { "start": "node index.js", "build": "echo nothing to build" },
+  "engines": { "node": ">=18 <23" },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "openai": "^4.52.0",
+    "express": "^4.19.2"
+  }
+}
