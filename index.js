@@ -28,7 +28,7 @@ async function safeReply(interaction, content, ephemeral = true) {
 }
 
 // ========= OpenAI =========
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, organization: process.env.OPENAI_ORG_ID });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 async function askLLM(model, system, user) {
   const r = await openai.chat.completions.create({
     model,
@@ -360,4 +360,4 @@ client.on('interactionCreate', async (interaction) => {
       const msg = interaction.options.getString('message', true);
       const lang = detectLang(msg, interaction.user.id);
       const system = lang==='pl'
-        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SGServ
+        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SGServers. Odpowiadaj szczegółowo i precyzyjnie po polsku.' : 'Jesteś Lumenem, pomocnym asystentem Discord SGServers. Odpowiadaj krótko, po polsku, r
