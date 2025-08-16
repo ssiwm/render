@@ -4,7 +4,7 @@ import OpenAI from 'openai';
 import express from 'express';
 
 // ========= Config =========
-const ALLOWED_PRO_ROLES = ['admini', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
+const ALLOWED_PRO_ROLES = ['admin', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
 const OWNER_ID = process.env.OWNER_DISCORD_ID || '';
 const MODELS = { ASK: 'gpt-4o-mini', PRO: 'gpt-4o' };
 const LIMITS = { GLOBAL_PER_DAY: 50, USER_PER_DAY: 5, ELEVATED_PER_DAY: 20 };
@@ -111,10 +111,17 @@ client.on('interactionCreate', async (interaction) => {
       const remUser = remainingFor(interaction.user.id, false);
       const remPro = hasProRole ? remainingFor(interaction.user.id, true) : 0;
       const remGlobal = Math.max(0, LIMITS.GLOBAL_PER_DAY - globalUsed);
-      const msg = `Global left: **${remGlobal}/${LIMITS.GLOBAL_PER_DAY}**
-Your /ask left: **${remUser}/${LIMITS.USER_PER_DAY}**${hasProRole?`
-Your /ask-pro left: **${remPro}/${LIMITS.ELEVATED_PER_DAY}**`:''}${isOwnerHelper?'
-(Helper bypass active)': ''}`;
+
+      // Bezpieczne budowanie wiadomości (bez backticków w backtickach)
+      const lines = [
+        `Global left: **${remGlobal}/${LIMITS.GLOBAL_PER_DAY}**`,
+        `Your /ask left: **${remUser}/${LIMITS.USER_PER_DAY}**`,
+      ];
+      if (hasProRole) lines.push(`Your /ask-pro left: **${remPro}/${LIMITS.ELEVATED_PER_DAY}**`);
+      if (isOwnerHelper) lines.push('(Helper bypass active)');
+
+      const msg = lines.join('
+');
       return interaction.reply({ content: msg, ephemeral: true });
     }
 
@@ -147,9 +154,9 @@ Your /ask-pro left: **${remPro}/${LIMITS.ELEVATED_PER_DAY}**`:''}${isOwnerHelper
       if (isPro){
         const role = member.roles.cache.find(r=>ALLOWED_PRO_ROLES.includes(r.name))?.name;
         const prefix = isOwnerHelper ? '✅ (Helper bypass)' : role ? `✅ You have **${role}**` : '';
-        return interaction.editReply(`${prefix ? prefix + '
+        return interaction.editReply(prefix ? `${prefix}
 
-' : ''}${answer}`);
+${answer}` : answer);
       }
       return interaction.editReply(answer);
     }
