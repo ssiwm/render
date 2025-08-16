@@ -1,7 +1,11 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder, ChannelType, PermissionsBitField } from 'discord.js';
 import OpenAI from 'openai';
 import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import { google } from 'googleapis';
+import Gamedig from 'gamedig';
 
 // ========= Config =========
 const ALLOWED_PRO_ROLES = ['admini', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
@@ -24,18 +28,80 @@ async function safeReply(interaction, content, ephemeral = true) {
 }
 
 // ========= OpenAI =========
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-async function askOpenAI(model, system, user) {
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, organization: process.env.OPENAI_ORG_ID });
+async function askLLM(model, system, user) {
   const r = await openai.chat.completions.create({
     model,
     temperature: 0.4,
     max_tokens: 600,
     messages: [ { role: 'system', content: system }, { role: 'user', content: user } ]
   });
-  return r.choices?.[0]?.message?.content?.trim() || 'No response.';
+  return { text: r.choices?.[0]?.message?.content?.trim() || 'No response.', usage: r.usage };
 }
 
-// ========= Limity =========
+// ========= Logging =========
+const LOG_DIR = path.join(process.cwd(), 'logs');
+const LOG_FILE = path.join(LOG_DIR, 'usage.csv');
+function ensureLogSetup(){
+  try {
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR);
+    if (!fs.existsSync(LOG_FILE)) fs.writeFileSync(LOG_FILE, 'ts,guildId,channelId,userId,command,model,promptTokens,completionTokens,totalTokens,elevated,globalUsed,userUsed,userProUsed
+');
+  } catch(e){ console.error('log setup', e); }
+}
+ensureLogSetup();
+function csv(val){ if (val==null) return '""'; const s=String(val).replaceAll('"','""'); return '"'+s+'"'; }
+let sheetsClient = null;
+async function getSheets(){
+  if (sheetsClient) return sheetsClient;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  const sheetId = process.env.GOOGLE_SHEETS_ID;
+  if (!raw || !sheetId) return null;
+  try {
+    let creds;
+    try { creds = JSON.parse(Buffer.from(raw, 'base64').toString('utf8')); }
+    catch { creds = JSON.parse(raw); }
+    const auth = new google.auth.JWT(creds.client_email, null, creds.private_key, ['https://www.googleapis.com/auth/spreadsheets']);
+    await auth.authorize();
+    const sheets = google.sheets({version:'v4', auth});
+    sheetsClient = { sheets, sheetId };
+    return sheetsClient;
+  } catch(e){ console.error('sheets auth', e); return null; }
+}
+async function appendSheet(values){
+  const cli = await getSheets();
+  if (!cli) return;
+  try {
+    await cli.sheets.spreadsheets.values.append({
+      spreadsheetId: cli.sheetId,
+      range: 'Usage!A1',
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [values] }
+    });
+  } catch(e){ console.error('sheets append', e); }
+}
+async function logToChannel(client, content){
+  const chanId = process.env.LOG_CHANNEL_ID;
+  if (!chanId) return;
+  try {
+    const ch = await client.channels.fetch(chanId);
+    await ch.send({ content });
+  } catch(e){ console.error('log channel', e); }
+}
+async function logUsage({ client, ctx, command, model, usage, elevated }){
+  const ts = new Date().toISOString();
+  const guildId = ctx.guild?.id || ctx.guildId || '';
+  const channelId = ctx.channel?.id || ctx.channelId || '';
+  const userId = ctx.user?.id || ctx.author?.id || '';
+  const e = userDaily.get(userId) || { used:0, usedPro:0 };
+  const row = [ts,guildId,channelId,userId,command,model,usage?.prompt_tokens||'',usage?.completion_tokens||'',usage?.total_tokens||'',elevated?'1':'0',globalUsed,e.used,e.usedPro].map(csv).join(',');
+  try { fs.appendFileSync(LOG_FILE, row+'
+'); } catch(err){ console.error('csv write', err); }
+  appendSheet([ts,guildId,channelId,userId,command,model,usage?.prompt_tokens||'',usage?.completion_tokens||'',usage?.total_tokens||'', elevated?1:0, globalUsed, e.used, e.usedPro]);
+  logToChannel(client, `🧾 **Log** ${command} by <@${userId}> | model ${model} | tokens: ${usage?.total_tokens ?? '?'} | global ${globalUsed}/${LIMITS.GLOBAL_PER_DAY}`);
+}
+
+// ========= Limits (in-memory) =========
 const userDaily = new Map(); // userId -> { used, usedPro }
 let globalDayKey = new Date().toISOString().slice(0,10);
 let globalUsed = 0;
@@ -69,7 +135,7 @@ function remainingFor(userId, elevated=false){
   return Math.max(0, per - used);
 }
 
-// ========= Język =========
+// ========= Language pref =========
 const userLang = new Map(); // userId -> 'pl' | 'en'
 function detectLang(text, userId){
   const pref = userLang.get(userId);
@@ -90,7 +156,15 @@ const commands = [
   new SlashCommandBuilder().setName('report').setDescription('Submit a server issue report to admins.').addStringOption(o=>o.setName('title').setDescription('Short title').setRequired(true)).addStringOption(o=>o.setName('details').setDescription('Describe the problem').setRequired(true)),
   new SlashCommandBuilder().setName('reply-ferox').setDescription('Post the prepared Ferox taming bug update for players.'),
   new SlashCommandBuilder().setName('set-lang').setDescription('Set your preferred language for bot responses.').addStringOption(o=>o.setName('language').setDescription('pl or en').setRequired(true).addChoices({name:'Polski',value:'pl'},{name:'English',value:'en'})),
-  new SlashCommandBuilder().setName('limits').setDescription('Show your remaining daily limits')
+  new SlashCommandBuilder().setName('limits').setDescription('Show your remaining daily limits'),
+  new SlashCommandBuilder().setName('status').setDescription('Show SGServers status (ARK/HTTP) now.'),
+  new SlashCommandBuilder().setName('announce').setDescription('Post a templated announcement (PL/EN).')
+    .addStringOption(o=>o.setName('type').setDescription('Template type').setRequired(true).addChoices({name:'event',value:'event'},{name:'update',value:'update'},{name:'restart',value:'restart'}))
+    .addStringOption(o=>o.setName('lang').setDescription('Language').setRequired(true).addChoices({name:'Polski',value:'pl'},{name:'English',value:'en'}))
+    .addStringOption(o=>o.setName('title').setDescription('Title').setRequired(true))
+    .addStringOption(o=>o.setName('when').setDescription('When? (optional)'))
+    .addStringOption(o=>o.setName('details').setDescription('Details (optional)'))
+    .addChannelOption(o=>o.setName('channel').setDescription('Target channel (optional)').addChannelTypes(ChannelType.GuildText))
 ].map(c=>c.toJSON());
 
 async function registerCommands(){
@@ -105,7 +179,109 @@ async function registerCommands(){
 client.once('ready', async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   try { await registerCommands(); } catch (e) { console.error(e); }
+  try { startAutoStatus(); } catch(e){ console.error('auto-status', e); }
 });
+
+// ========= Helpers =========
+function userHasAnnouncePerm(member){
+  try {
+    return member.permissions.has(PermissionsBitField.Flags.ManageGuild)
+        || member.roles.cache.some(r=>ALLOWED_PRO_ROLES.includes(r.name))
+        || (member.roles.cache.some(r=>r.name==='Helper') && member.id===OWNER_ID);
+  } catch { return false; }
+}
+function buildAnnouncement({type, lang, title, when, details}){
+  const L = (pl,en)=> (lang==='pl'?pl:en);
+  if (type==='event'){
+    return L(
+      `🎉 **Wydarzenie**: ${title}${when?`
+🗓 ${when}`:''}${details?`
+
+${details}`:''}`,
+      `🎉 **Event**: ${title}${when?`
+🗓 ${when}`:''}${details?`
+
+${details}`:''}`
+    );
+  }
+  if (type==='restart'){
+    return L(
+      `🔁 **Restart serwera**: ${title}${when?`
+🕒 ${when}`:''}${details?`
+
+${details}`:''}`,
+      `🔁 **Server restart**: ${title}${when?`
+🕒 ${when}`:''}${details?`
+
+${details}`:''}`
+    );
+  }
+  // update
+  return L(
+    `🛠 **Aktualizacja**: ${title}${when?`
+🕒 ${when}`:''}${details?`
+
+${details}`:''}`,
+    `🛠 **Update**: ${title}${when?`
+🕒 ${when}`:''}${details?`
+
+${details}`:''}`
+  );
+}
+
+// ========= STATUS =========
+function parsePairs(env){
+  if (!env) return [];
+  return env.split(',').map(s=>s.trim()).filter(Boolean).map(p=>{
+    const [name, rest] = p.split('|');
+    return { name: name?.trim()||rest, value: rest?.trim()||'' };
+  });
+}
+async function queryArk(host, port){
+  try { const r = await Gamedig.query({ type: 'arkse', host, port: Number(port) });
+    return { ok:true, name:r.name, map:r.map, players:r.players?.length||0, max:r.maxplayers||0, ping:r.ping };
+  } catch(e){ return { ok:false, error:String(e.message||e) }; }
+}
+async function queryHttp(url){
+  try { const res = await fetch(url, { method:'GET' }); return { ok: res.ok, status: res.status };
+  } catch(e){ return { ok:false, error:String(e.message||e) }; }
+}
+const lastStatus = new Map();
+async function buildStatusSummary(){
+  const arkDefs = parsePairs(process.env.STATUS_SERVERS);
+  const httpDefs = parsePairs(process.env.STATUS_HTTP_URLS);
+  const lines = [];
+  for (const d of arkDefs){
+    const [host,port] = d.value.split(':');
+    const r = await queryArk(host, port);
+    if (r.ok) lines.push(`✅ **${d.name}** — ${r.players}/${r.max} players, ping ${r.ping}ms`);
+    else lines.push(`❌ **${d.name}** — offline`);
+    lastStatus.set(`ark:${d.name}`, r.ok);
+  }
+  for (const d of httpDefs){
+    const r = await queryHttp(d.value);
+    if (r.ok) lines.push(`✅ **${d.name}** — HTTP ${r.status}`);
+    else lines.push(`❌ **${d.name}** — HTTP error`);
+    lastStatus.set(`http:${d.name}`, r.ok);
+  }
+  return lines.join('
+');
+}
+async function startAutoStatus(){
+  const chanId = process.env.STATUS_CHANNEL_ID;
+  if (!chanId) return; // disabled
+  const postIfChanged = async () => {
+    const chan = await client.channels.fetch(chanId);
+    const before = new Map(lastStatus);
+    const text = await buildStatusSummary();
+    let changed = !before.size;
+    for (const [k,v] of lastStatus){ if (before.get(k) !== v) { changed = true; break; } }
+    if (changed){ await chan.send({ content: `📊 **Server status**
+${text}` }); }
+  };
+  setTimeout(postIfChanged, 10_000);
+  setInterval(postIfChanged, 5*60*1000);
+}
 
 client.on('interactionCreate', async (interaction) => {
   try {
@@ -133,8 +309,29 @@ client.on('interactionCreate', async (interaction) => {
       if (hasProRole) lines.push(`Your /ask-pro left: **${remPro}/${LIMITS.ELEVATED_PER_DAY}**`);
       if (isOwnerHelper) lines.push('(Helper bypass active)');
 
-      const msg = lines.join('\n');
+      const msg = lines.join('
+');
       return interaction.reply({ content: msg, ephemeral: true });
+    }
+
+    if (interaction.commandName === 'status'){
+      await interaction.deferReply({ ephemeral: true });
+      const text = await buildStatusSummary();
+      return interaction.editReply(text || 'No status sources configured.');
+    }
+
+    if (interaction.commandName === 'announce'){
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      if (!userHasAnnouncePerm(member)) return interaction.reply({ content: '⛔ Brak uprawnień do ogłoszeń.', ephemeral: true });
+      const type = interaction.options.getString('type', true);
+      const lang = interaction.options.getString('lang', true);
+      const title = interaction.options.getString('title', true);
+      const when = interaction.options.getString('when');
+      const details = interaction.options.getString('details');
+      const channel = interaction.options.getChannel('channel') || (process.env.ANNOUNCE_CHANNEL_ID ? await interaction.client.channels.fetch(process.env.ANNOUNCE_CHANNEL_ID) : interaction.channel);
+      const content = buildAnnouncement({ type, lang, title, when, details });
+      await channel.send({ content });
+      return interaction.reply({ content: '✅ Ogłoszenie wysłane.', ephemeral: true });
     }
 
     if (interaction.commandName === 'ask' || interaction.commandName === 'ask-pro'){
@@ -159,120 +356,14 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       await interaction.deferReply();
+      const model = isPro ? MODELS.PRO : MODELS.ASK;
 
-      // --- BEZPIECZNY CALL DO OPENAI ---
-      let answer;
+      let result;
       try {
-        const model = isPro ? MODELS.PRO : MODELS.ASK;
-        answer = await askOpenAI(model, system, msg);
+        result = await askLLM(model, system, msg); // { text, usage }
       } catch (err) {
         console.error('LLM error', err);
         const friendly = isBillingInactiveError(err)
           ? '⚠️ AI jest chwilowo niedostępne (billing OpenAI nieaktywny). Admin już to ogarnia.'
           : '⚠️ Coś poszło nie tak po stronie AI. Spróbuj ponownie za chwilę.';
-        await safeReply(interaction, friendly, true);
-        return;
-      }
-
-      consume(interaction.user.id, isPro, isOwnerHelper);
-
-      if (isPro){
-        const role = member.roles.cache.find(r=>ALLOWED_PRO_ROLES.includes(r.name))?.name;
-        const prefix = isOwnerHelper ? '✅ (Helper bypass)' : role ? `✅ You have **${role}**` : '';
-        return interaction.editReply(prefix ? `${prefix}
-
-${answer}` : answer);
-      }
-      return interaction.editReply(answer);
-    }
-
-    if (interaction.commandName === 'report'){
-      await interaction.deferReply({ ephemeral: true });
-      const title = interaction.options.getString('title', true);
-      const details = interaction.options.getString('details', true);
-      const targetChannelId = process.env.REPORTS_CHANNEL_ID || interaction.channelId;
-      const channel = await interaction.client.channels.fetch(targetChannelId);
-      await channel.send({ content: `📣 **New Player Report**
-**From:** ${interaction.user}
-**Title:** ${title}
-**Details:** ${details}` });
-      return interaction.editReply('Dzięki! Twoje zgłoszenie zostało przesłane do administracji. ✅');
-    }
-
-    if (interaction.commandName === 'reply-ferox'){
-      const text = `**📢 Ferox Taming Issue – Update & Workarounds**
-
-Hey everyone 👋 Thanks a lot for reporting the Ferox taming problem and sharing details 🙏
-
-Here’s what we know so far:
-
-🔎 **The issue**
-- After feeding **5–6 element**, the Ferox suddenly **despawns/disappears**.
-- Happens even when you keep aggro and move it to a safe spot.
-- This looks very similar to a known vanilla ARK bug where Ferox falls through terrain or poofs mid-tame.
-
-🛠 **Workarounds you can try:**
-1. **Tame in an open, flat area** – avoid caves, uneven ground, or bases.
-2. **Use a Cryopod immediately after taming** – helps prevent later despawns.
-3. **Be careful around server restarts** – pod them before restart just in case.
-
-📨 **What’s next**
-- I’ve already reported the issue to the DOX devs with all your info (server ID + mod list).
-- Waiting to hear back if this is DOX-related or just a base-game Ferox bug.
-- I’ll keep you updated as soon as we get feedback. 👍
-
-❤️ Thanks again for helping spot this. I know taming Ferox is already tough, and it sucks when bugs get in the way – hopefully we’ll get a fix or at least a clear answer soon!`;
-      return interaction.reply({ content: text });
-    }
-  } catch (err) {
-    console.error(err);
-    await safeReply(interaction, 'Coś poszło nie tak. Spróbuj ponownie lub pingnij admina.', true);
-  }
-});
-
-// Mentions
-client.on('messageCreate', async (msg) => {
-  try {
-    if (msg.author.bot) return;
-    const mentioned = msg.mentions.users.has(client.user.id);
-    if (!mentioned) return;
-
-    const mention1 = `<@${client.user.id}>`;
-    const mention2 = `<@!${client.user.id}>`;
-    const text = msg.content.replaceAll(mention1, '').replaceAll(mention2, '').trim();
-    if (!text) return msg.reply('Hi! Use `/ask` to talk to me, or type your question after mentioning me.');
-
-    const lang = detectLang(text, msg.author.id);
-    const system = lang==='pl' ? 'Jesteś Lumenem, pomocnym asystentem Discord SGServers. Odpowiadaj po polsku, zwięźle i przyjaźnie.' : 'You are Lumen, a friendly Discord helper for SGServers. Keep answers concise, helpful, and game-focused.';
-
-    const gate = canUse(msg.author.id, false, false);
-    if (!gate.ok) return msg.reply('⛔ Limit dzienny został osiągnięty. Użyj `/limits`.');
-
-    await msg.channel.sendTyping();
-
-    // --- BEZPIECZNY CALL DO OPENAI ---
-    let answer;
-    try {
-      answer = await askOpenAI(MODELS.ASK, system, text);
-    } catch (err) {
-      console.error('mention LLM error', err);
-      const friendly = isBillingInactiveError(err)
-        ? '⚠️ AI chwilowo niedostępne (billing).'
-        : '⚠️ Błąd po stronie AI.';
-      return msg.reply(friendly);
-    }
-
-    consume(msg.author.id, false, false);
-    await msg.reply(answer);
-  } catch (e) { console.error('mention handler error', e); }
-});
-
-client.login(process.env.DISCORD_BOT_TOKEN);
-
-// Optional tiny HTTP server (helps if service type = Web)
-const PORT = process.env.PORT;
-if (PORT){
-  const app = express();
-  app.get('/', (_,res)=>res.send('SGServers Discord bot is running.'));
-  app.listen(PORT, ()=>console.log('HTTP health on', PORT));
-}
+        await safeReply(inter
