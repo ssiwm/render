@@ -16,7 +16,8 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { google } from 'googleapis';
-import * as Gamedig from 'gamedig';
+import Gamedig from 'gamedig';
+
 /*
  * SGServers Discord Bot
  *
@@ -201,14 +202,17 @@ function parseServerPairs(env) {
     const [nameRaw, restRaw] = p.split('|');
     const name = (nameRaw || '').trim();
     let right = (restRaw || '').trim();
+    // Default game type for ARK servers. GameDig expects 'arkse' for ARK: Survival Evolved.
     let type = 'arkse';
     if (right.includes(';')) {
       const parts = right.split(';').map((x) => x.trim()).filter(Boolean);
       right = parts[0];
       for (let i = 1; i < parts.length; i++) {
         const [k, v] = parts[i].split('=');
-        if ((k || '').trim().toLowerCase() === 'type' && v) type = v.trim();
+        if ((k || '').trim().toLowerCase() === 'type' && v) type = v.trim().toLowerCase();
       }
+      // Normalize common synonyms. 'ase' and 'asa' both map to 'arkse'.
+      if (type === 'ase' || type === 'asa') type = 'arkse';
     }
     const [host, portStr] = right.split(':');
     const port = Number(portStr);
