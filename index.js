@@ -133,8 +133,7 @@ client.on('interactionCreate', async (interaction) => {
       if (hasProRole) lines.push(`Your /ask-pro left: **${remPro}/${LIMITS.ELEVATED_PER_DAY}**`);
       if (isOwnerHelper) lines.push('(Helper bypass active)');
 
-      const msg = lines.join('
-');
+      const msg = lines.join('\n');
       return interaction.reply({ content: msg, ephemeral: true });
     }
 
