@@ -39,6 +39,40 @@ async function askLLM(model, system, user) {
   return { text: r.choices?.[0]?.message?.content?.trim() || 'No response.', usage: r.usage };
 }
 
+// ========= Limits (in-memory) =========
+const userDaily = new Map(); // userId -> { used, usedPro }
+let globalDayKey = new Date().toISOString().slice(0,10);
+let globalUsed = 0;
+function dayKeyNow(){ return new Date().toISOString().slice(0,10); }
+function resetIfNewDay(){
+  const k = dayKeyNow();
+  if (k !== globalDayKey){ globalDayKey = k; globalUsed = 0; userDaily.clear(); }
+}
+function canUse(userId, elevated=false, isOwnerHelper=false){
+  resetIfNewDay();
+  if (isOwnerHelper) return { ok: true };
+  if (globalUsed >= LIMITS.GLOBAL_PER_DAY) return { ok:false, reason:'global' };
+  const e = userDaily.get(userId) || { used:0, usedPro:0 };
+  const per = elevated ? LIMITS.ELEVATED_PER_DAY : LIMITS.USER_PER_DAY;
+  const used = elevated ? e.usedPro : e.used;
+  if (used >= per) return { ok:false, reason:'user' };
+  return { ok:true };
+}
+function consume(userId, elevated=false, isOwnerHelper=false){
+  if (isOwnerHelper) return;
+  globalUsed++;
+  const e = userDaily.get(userId) || { used:0, usedPro:0 };
+  elevated ? e.usedPro++ : e.used++;
+  userDaily.set(userId, e);
+}
+function remainingFor(userId, elevated=false){
+  resetIfNewDay();
+  const e = userDaily.get(userId) || { used:0, usedPro:0 };
+  const per = elevated ? LIMITS.ELEVATED_PER_DAY : LIMITS.USER_PER_DAY;
+  const used = elevated ? e.usedPro : e.used;
+  return Math.max(0, per - used);
+}
+
 // ========= Logging =========
 const LOG_DIR = path.join(process.cwd(), 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'usage.csv');
@@ -100,40 +134,6 @@ async function logUsage({ client, ctx, command, model, usage, elevated }){
 '); } catch(err){ console.error('csv write', err); }
   appendSheet([ts,guildId,channelId,userId,command,model,usage?.prompt_tokens||'',usage?.completion_tokens||'',usage?.total_tokens||'', elevated?1:0, globalUsed, e.used, e.usedPro]);
   logToChannel(client, `🧾 **Log** ${command} by <@${userId}> | model ${model} | tokens: ${usage?.total_tokens ?? '?'} | global ${globalUsed}/${LIMITS.GLOBAL_PER_DAY}`);
-}
-
-// ========= Limits (in-memory) =========
-const userDaily = new Map(); // userId -> { used, usedPro }
-let globalDayKey = new Date().toISOString().slice(0,10);
-let globalUsed = 0;
-function dayKeyNow(){ return new Date().toISOString().slice(0,10); }
-function resetIfNewDay(){
-  const k = dayKeyNow();
-  if (k !== globalDayKey){ globalDayKey = k; globalUsed = 0; userDaily.clear(); }
-}
-function canUse(userId, elevated=false, isOwnerHelper=false){
-  resetIfNewDay();
-  if (isOwnerHelper) return { ok: true };
-  if (globalUsed >= LIMITS.GLOBAL_PER_DAY) return { ok:false, reason:'global' };
-  const e = userDaily.get(userId) || { used:0, usedPro:0 };
-  const per = elevated ? LIMITS.ELEVATED_PER_DAY : LIMITS.USER_PER_DAY;
-  const used = elevated ? e.usedPro : e.used;
-  if (used >= per) return { ok:false, reason:'user' };
-  return { ok:true };
-}
-function consume(userId, elevated=false, isOwnerHelper=false){
-  if (isOwnerHelper) return;
-  globalUsed++;
-  const e = userDaily.get(userId) || { used:0, usedPro:0 };
-  elevated ? e.usedPro++ : e.used++;
-  userDaily.set(userId, e);
-}
-function remainingFor(userId, elevated=false){
-  resetIfNewDay();
-  const e = userDaily.get(userId) || { used:0, usedPro:0 };
-  const per = elevated ? LIMITS.ELEVATED_PER_DAY : LIMITS.USER_PER_DAY;
-  const used = elevated ? e.usedPro : e.used;
-  return Math.max(0, per - used);
 }
 
 // ========= Language pref =========
@@ -360,4 +360,4 @@ client.on('interactionCreate', async (interaction) => {
       const msg = interaction.options.getString('message', true);
       const lang = detectLang(msg, interaction.user.id);
       const system = lang==='pl'
-        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SGServers. Odpowiadaj szczegółowo i precyzyjnie po polsku.' : 'Jesteś Lumenem, pomocnym asystentem Discord SGServers. Odpowiadaj krótko, po polsku, r
+        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SGServers. Odpowiadaj szczegółowo i precyzyjnie po polsku.' : 'Jesteś Lumenem, pomocnym asystentem Discord SGServers. Odpowiadaj krótko, po polsku, rzeczowo 
