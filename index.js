@@ -532,50 +532,79 @@ client.on('interactionCreate', async (interaction) => {
     }
     // kb-add: add a document to the knowledge base
     if (interaction.commandName === 'kb-add') {
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-      if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
-        return interaction.reply({ content: '⛔ Admin only.', flags: MessageFlags.Ephemeral });
+      // Defer the reply immediately to prevent timeouts and use flags instead of deprecated `ephemeral`.
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      // Check permissions using memberPermissions. Avoid fetching guild members, which requires an extra intent.
+      const perms = interaction.memberPermissions ?? interaction.member?.permissions;
+      if (!perms?.has(PermissionsBitField.Flags.ManageGuild)) {
+        return interaction.editReply('⛔ Admin only.');
       }
       const title = interaction.options.getString('title', true);
       const content = interaction.options.getString('content', true);
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const r = await kbAddDoc({ title, text: content, source: 'manual', lang: 'en' });
-      if (!r.ok) return interaction.editReply('❌ KB not configured (Qdrant).');
-      return interaction.editReply(`✅ Added to KB: **${title}** (${r.chunks} chunks)`);
+      try {
+        const r = await kbAddDoc({ title, text: content, source: 'manual', lang: 'en' });
+        if (!r.ok) return interaction.editReply('❌ KB not configured (Qdrant).');
+        return interaction.editReply(`✅ Added to KB: **${title}** (${r.chunks} chunks)`);
+      } catch (e) {
+        console.error('[kb-add]', e);
+        const msg = (e?.message || String(e)).slice(0, 400);
+        return interaction.editReply(`❌ KB error: ${msg}`);
+      }
     }
 
     // kb-search: search the knowledge base
     if (interaction.commandName === 'kb-search') {
-      const q = interaction.options.getString('query', true);
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const hits = await kbSearch(q, 5);
-      if (!hits.length) return interaction.editReply('No KB matches.');
-      const lines = hits.map((h, i) => `**${i + 1}. ${h.title}** [${(h.score * 100) | 0}%]\n${h.text.slice(0, 300)}${h.text.length > 300 ? '…' : ''}`);
-      return interaction.editReply(lines.join('\n\n'));
+      try {
+        const q = interaction.options.getString('query', true);
+        const hits = await kbSearch(q, 5);
+        if (!hits?.length) return interaction.editReply('⚠️ Brak trafień.');
+        const lines = hits.map((h, i) =>
+          `**${i + 1}. ${h.title || '—'}** (score: ${h.score?.toFixed(3) ?? '?'})\n` +
+          `${(h.text || '').slice(0, 300)}${(h.text || '').length > 300 ? '…' : ''}`
+        );
+        return interaction.editReply(lines.join('\n\n'));
+      } catch (e) {
+        console.error('[kb-search]', e);
+        const msg = (e?.message || String(e)).slice(0, 400);
+        return interaction.editReply(`❌ KB error: ${msg}`);
+      }
     }
 
     // kb-import-pins: import pinned messages from a channel into the KB
     if (interaction.commandName === 'kb-import-pins') {
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-      if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
-        return interaction.reply({ content: '⛔ Admin only.', flags: MessageFlags.Ephemeral });
-      }
-      const channel = interaction.options.getChannel('channel', true);
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       try {
-        const pins = await channel.messages.fetchPinned();
-        if (!pins.size) return interaction.editReply('No pinned messages.');
-        let added = 0;
-        for (const [, msg] of pins) {
-          const title = `${channel.name} pin (${msg.id})`;
-          const text = `Author: ${msg.author?.username || 'unknown'}\nDate: ${msg.createdAt?.toISOString?.() || ''}\n\n${msg.content || ''}`;
-          const res = await kbAddDoc({ title, text, source: `pin:#${channel.name}`, lang: 'en' });
-          if (res.ok) added += res.chunks;
+        const perms = interaction.memberPermissions ?? interaction.member?.permissions;
+        if (!perms?.has(PermissionsBitField.Flags.ManageGuild)) {
+          return interaction.editReply('⛔ Admin only.');
         }
-        return interaction.editReply(`✅ Imported pins from #${channel.name}. Chunks: ${added}`);
+        const channel = interaction.options.getChannel('channel', true);
+        const pins = await channel.messages.fetchPinned();
+        if (!pins?.size) return interaction.editReply('⚠️ Brak przypiętych wiadomości.');
+        let ok = 0, fail = 0;
+        for (const msg of pins.values()) {
+          if (msg.author?.bot) continue;
+          const text = msg.cleanContent?.trim();
+          if (!text) continue;
+          try {
+            const title = (text.split('\n')[0] || 'Pin').slice(0, 80);
+            await kbAddDoc({
+              title,
+              text,
+              lang: 'en',
+              source: msg.url
+            });
+            ok++;
+          } catch {
+            fail++;
+          }
+        }
+        return interaction.editReply(`📌 Zaimportowano z #${channel.name}: **${ok}** OK, **${fail}** błędów.`);
       } catch (e) {
-        console.error('kb-import-pins', e);
-        return interaction.editReply('❌ Failed to import pins.');
+        console.error('[kb-import-pins]', e);
+        const msg = (e?.message || String(e)).slice(0, 400);
+        return interaction.editReply(`❌ KB error: ${msg}`);
       }
     }
 
@@ -656,4 +685,12 @@ app.listen(port, () => {
 });
 client.login(process.env.DISCORD_BOT_TOKEN).catch((e) => {
   console.error('Discord login failed', e);
+});
+
+// Catch global unhandled promise rejections and uncaught exceptions to prevent crashes and log errors.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
 });
