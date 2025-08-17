@@ -205,18 +205,36 @@ function parseServerPairs(env) {
     const [nameRaw, restRaw] = p.split('|');
     const name = (nameRaw || '').trim();
     let right = (restRaw || '').trim();
-    // Default game type for ARK servers. GameDig expects 'arkse' for ARK: Survival Evolved.
+    // Default type is ARK: Survival Evolved (GameDig id 'arkse'). We'll override
+    // this based on parameters or the server name.
     let type = 'arkse';
+    let hintType = null;
+    // Check for semicolon parameters appended to the host:port part, e.g.
+    // "ip:port;type=ase". Only the first part before the semicolon is the
+    // host:port; subsequent parts are key=value parameters.
     if (right.includes(';')) {
       const parts = right.split(';').map((x) => x.trim()).filter(Boolean);
       right = parts[0];
       for (let i = 1; i < parts.length; i++) {
         const [k, v] = parts[i].split('=');
-        if ((k || '').trim().toLowerCase() === 'type' && v) type = v.trim().toLowerCase();
+        if ((k || '').trim().toLowerCase() === 'type' && v) {
+          hintType = v.trim().toLowerCase();
+        }
       }
-      // Normalize common synonyms. 'ase' and 'asa' both map to 'arkse'.
-      if (type === 'ase' || type === 'asa') type = 'arkse';
     }
+    // If no explicit type provided, attempt to derive from the server name
+    // (e.g. "DOX EASY (ASE)" => hintType = "ase").
+    if (!hintType) {
+      const match = name.match(/\(([^)]+)\)/);
+      if (match) {
+        hintType = match[1].trim().toLowerCase();
+      }
+    }
+    if (hintType) {
+      type = hintType;
+    }
+    // Normalize common synonyms. 'ase' and 'asa' both map to 'arkse'.
+    if (type === 'ase' || type === 'asa') type = 'arkse';
     const [host, portStr] = right.split(':');
     const port = Number(portStr);
     return { name: name || right, host: (host || '').trim(), port, type };
