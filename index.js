@@ -468,9 +468,9 @@ client.on('interactionCreate', async (interaction) => {
     // limits
     if (interaction.commandName === 'limits') {
       resetIfNewDay();
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-      const hasProRole = member.roles.cache.some(r => ALLOWED_PRO_ROLES.includes(r.name));
-      const isOwnerHelper = member.roles.cache.some(r => r.name === 'Helper') && interaction.user.id === OWNER_ID;
+      const member = interaction.member;
+      const hasProRole = member?.roles?.cache?.some(r => ALLOWED_PRO_ROLES.includes(r.name)) || false;
+	  const isOwnerHelper = member?.roles?.cache?.some(r => r.name === 'Helper') && interaction.user.id === OWNER_ID;
       const remUser = remainingFor(interaction.user.id, false);
       const remPro = hasProRole ? remainingFor(interaction.user.id, true) : 0;
       const remGlobal = Math.max(0, LIMITS.GLOBAL_PER_DAY - globalUsed);
@@ -490,7 +490,7 @@ client.on('interactionCreate', async (interaction) => {
     }
     // announce
     if (interaction.commandName === 'announce') {
-      const member = await interaction.guild.members.fetch(interaction.user.id);
+      const member = interaction.member;
       if (!userHasAnnouncePerm(member)) {
         return interaction.reply({ content: '⛔ Brak uprawnień do ogłoszeń.', flags: MessageFlags.Ephemeral });
       }
@@ -654,7 +654,7 @@ client.on('interactionCreate', async (interaction) => {
     // ask / ask-pro
     if (interaction.commandName === 'ask' || interaction.commandName === 'ask-pro') {
       const isPro = interaction.commandName === 'ask-pro';
-      const member = await interaction.guild.members.fetch(interaction.user.id);
+      const member = interaction.member;
       const hasProRole = member.roles.cache.some(r => ALLOWED_PRO_ROLES.includes(r.name));
       const isOwnerHelper = member.roles.cache.some(r => r.name === 'Helper') && interaction.user.id === OWNER_ID;
       if (isPro && !hasProRole && !isOwnerHelper) {
@@ -674,7 +674,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.deferReply();
       try {
         // Perform a knowledge-base search for context
-        const hits = await kbSearch(msg, 5);
+        const hits = await withTimeout(kbSearch(msg, 5), KB_TIMEOUT_MS, 'kbSearch');
         const context = hits
           .map((d, i) => `#${i + 1} ${d.title} (s=${d.score !== undefined ? d.score.toFixed(2) : '0.00'}, src=${d.source})\n${d.text}`)
           .join('\n\n');
