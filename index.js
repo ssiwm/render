@@ -69,6 +69,35 @@ async function safeReply(interaction, content, isEphemeral = true) {
   }
 }
 
+// ========= Utility functions =========
+// Timeout wrapper. Rejects the promise if it takes longer than `ms` milliseconds.
+// Timeout (in milliseconds) for knowledge base operations. If a call to the knowledge base
+// (e.g., generating embeddings or upserting/searching in Qdrant) takes longer than this,
+// it will be aborted and an error will be thrown. Adjust this value based on your
+// environment's network latency and typical response times.
+const KB_TIMEOUT_MS = 15000;
+
+/**
+ * Wrap a promise with a timeout. If the underlying promise does not settle within
+ * `ms` milliseconds, this returns a rejected promise with a timeout error. This
+ * ensures that long-running operations (such as embedding generation or vector
+ * database queries) do not block the bot forever.
+ *
+ * @param {Promise} promise The promise to wrap.
+ * @param {number} ms Maximum allowed time in milliseconds.
+ * @param {string} label A descriptive label used in the timeout error message.
+ * @returns {Promise} A promise that resolves/rejects with the underlying
+ *                    promise or rejects on timeout.
+ */
+function withTimeout(promise, ms = KB_TIMEOUT_MS, label = 'operation') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
 // ========= OpenAI =========
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 async function askLLM(model, system, user, messages = null) {
@@ -542,7 +571,12 @@ client.on('interactionCreate', async (interaction) => {
       const title = interaction.options.getString('title', true);
       const content = interaction.options.getString('content', true);
       try {
-        const r = await kbAddDoc({ title, text: content, source: 'manual', lang: 'en' });
+        // Wrap kbAddDoc in a timeout to ensure the bot does not hang indefinitely.
+        const r = await withTimeout(
+          kbAddDoc({ title, text: content, source: 'manual', lang: 'en' }),
+          KB_TIMEOUT_MS,
+          'kbAddDoc'
+        );
         if (!r.ok) return interaction.editReply('❌ KB not configured (Qdrant).');
         return interaction.editReply(`✅ Added to KB: **${title}** (${r.chunks} chunks)`);
       } catch (e) {
@@ -557,7 +591,12 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       try {
         const q = interaction.options.getString('query', true);
-        const hits = await kbSearch(q, 5);
+        // Wrap kbSearch in a timeout to prevent long-running operations from causing timeouts.
+        const hits = await withTimeout(
+          kbSearch(q, 5),
+          KB_TIMEOUT_MS,
+          'kbSearch'
+        );
         if (!hits?.length) return interaction.editReply('⚠️ Brak trafień.');
         const lines = hits.map((h, i) =>
           `**${i + 1}. ${h.title || '—'}** (score: ${h.score?.toFixed(3) ?? '?'})\n` +
@@ -589,12 +628,16 @@ client.on('interactionCreate', async (interaction) => {
           if (!text) continue;
           try {
             const title = (text.split('\n')[0] || 'Pin').slice(0, 80);
-            await kbAddDoc({
-              title,
-              text,
-              lang: 'en',
-              source: msg.url
-            });
+            await withTimeout(
+              kbAddDoc({
+                title,
+                text,
+                lang: 'en',
+                source: msg.url
+              }),
+              KB_TIMEOUT_MS,
+              'kbAddDoc'
+            );
             ok++;
           } catch {
             fail++;
