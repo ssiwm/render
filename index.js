@@ -342,7 +342,28 @@ const commands = [
     .addStringOption(o => o.setName('title').setDescription('Title').setRequired(true))
     .addStringOption(o => o.setName('when').setDescription('When? (optional)'))
     .addStringOption(o => o.setName('details').setDescription('Details (optional)'))
-    .addChannelOption(o => o.setName('channel').setDescription('Target channel (optional)').addChannelTypes(ChannelType.GuildText))
+    .addChannelOption(o => o.setName('channel').setDescription('Target channel (optional)').addChannelTypes(ChannelType.GuildText)),
+  // Command to read recent messages from a channel. This command allows
+  // moderators or users with appropriate permissions to fetch the latest
+  // messages in a text channel. The bot must have the View Channel and
+  // Read Message History permissions, along with the Message Content
+  // intent enabled, for this to work. A limit option caps the number
+  // of messages retrieved.
+  new SlashCommandBuilder()
+    .setName('read-channel')
+    .setDescription('Read recent messages from a channel (default: current channel).')
+    .addChannelOption(o =>
+      o
+        .setName('channel')
+        .setDescription('Channel to read (defaults to the current channel)')
+        .addChannelTypes(ChannelType.GuildText)
+    )
+    .addIntegerOption(o =>
+      o
+        .setName('limit')
+        .setDescription('Number of messages to retrieve (1-50, defaults to 10)')
+        .setRequired(false)
+    )
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -431,6 +452,38 @@ client.on('interactionCreate', async (interaction) => {
       const update = '🦖 **Ferox taming bug update**\nPL: Aktualizacja dotycząca błędu oswajania Feroxa została opublikowana. Sprawdź naszego Discorda lub patch notes, aby uzyskać więcej informacji.\nEN: The update regarding the Ferox taming bug has been published. Check our Discord or the patch notes for details.';
       await interaction.channel.send({ content: update });
       return interaction.reply({ content: '✅ Update posted.', ephemeral: true });
+    }
+
+    // read-channel
+    if (interaction.commandName === 'read-channel') {
+      // Read recent messages from a specified channel. Defaults to the current
+      // channel if none is provided. The bot must have View Channel, Read
+      // Message History permissions and the Message Content intent enabled.
+      const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
+      let limit = interaction.options.getInteger('limit');
+      if (!limit || isNaN(limit)) limit = 10;
+      limit = Math.min(50, Math.max(1, limit));
+      try {
+        const fetched = await targetChannel.messages.fetch({ limit });
+        const sorted = Array.from(fetched.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+        const lines = [];
+        for (const msg of sorted) {
+          const author = msg.author?.tag || msg.author?.username || 'Unknown';
+          let content = msg.content?.toString() || '';
+          if (!content.trim()) content = '(embed/attachment)';
+          if (content.length > 200) content = content.slice(0, 197) + '...';
+          lines.push(`**${author}**: ${content}`);
+        }
+        if (!lines.length) {
+          return interaction.reply({ content: '⚠️ No messages found in that channel.', ephemeral: true });
+        }
+        let response = lines.join('\n');
+        if (response.length > 1900) response = response.slice(-1900);
+        return interaction.reply({ content: response, allowedMentions: { parse: [] }, ephemeral: true });
+      } catch (e) {
+        console.error('read-channel', e);
+        return interaction.reply({ content: '⚠️ Failed to fetch messages (check permissions and intents).', ephemeral: true });
+      }
     }
     // ask / ask-pro
     if (interaction.commandName === 'ask' || interaction.commandName === 'ask-pro') {
