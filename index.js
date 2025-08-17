@@ -9,7 +9,8 @@ import {
   Routes,
   SlashCommandBuilder,
   ChannelType,
-  PermissionsBitField
+  PermissionsBitField,
+  MessageFlags
 } from 'discord.js';
 import OpenAI from 'openai';
 import express from 'express';
@@ -51,11 +52,18 @@ function isBillingInactiveError(err) {
     (err?.status === 429 && /billing/i.test(err?.error?.message || err?.message || ''))
   );
 }
-async function safeReply(interaction, content, ephemeral = true) {
+async function safeReply(interaction, content, isEphemeral = true) {
   try {
-    if (interaction.deferred) return interaction.editReply(content);
-    if (interaction.replied) return interaction.followUp({ content, ephemeral });
-    return interaction.reply({ content, ephemeral });
+    // Build an options object. If content is already an object (e.g. contains allowedMentions), merge it.
+    const options =
+      content && typeof content === 'object' && !Array.isArray(content)
+        ? { ...content }
+        : { content };
+    // Apply the Ephemeral flag when requested. Discord.js v14 deprecates the `ephemeral` field on interaction responses.
+    if (isEphemeral) options.flags = MessageFlags.Ephemeral;
+    if (interaction.deferred) return interaction.editReply(options);
+    if (interaction.replied) return interaction.followUp(options);
+    return interaction.reply(options);
   } catch (e) {
     console.error('safeReply', e);
   }
@@ -426,7 +434,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'set-lang') {
       const lang = interaction.options.getString('language', true);
       userLang.set(interaction.user.id, lang);
-      return interaction.reply({ content: lang === 'pl' ? '✅ Ustawiono język na **polski**.' : '✅ Language set to **English**.', ephemeral: true });
+      return interaction.reply({ content: lang === 'pl' ? '✅ Ustawiono język na **polski**.' : '✅ Language set to **English**.', flags: MessageFlags.Ephemeral });
     }
     // limits
     if (interaction.commandName === 'limits') {
@@ -443,11 +451,11 @@ client.on('interactionCreate', async (interaction) => {
       ];
       if (hasProRole) lines.push(`Your /ask-pro left: **${remPro}/${LIMITS.ELEVATED_PER_DAY}**`);
       if (isOwnerHelper) lines.push('(Helper bypass active)');
-      return interaction.reply({ content: lines.join('\n'), ephemeral: true });
+      return interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
     }
     // status
     if (interaction.commandName === 'status') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const text = await buildStatusSummary();
       return interaction.editReply(text || 'No status sources configured.');
     }
@@ -455,7 +463,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'announce') {
       const member = await interaction.guild.members.fetch(interaction.user.id);
       if (!userHasAnnouncePerm(member)) {
-        return interaction.reply({ content: '⛔ Brak uprawnień do ogłoszeń.', ephemeral: true });
+        return interaction.reply({ content: '⛔ Brak uprawnień do ogłoszeń.', flags: MessageFlags.Ephemeral });
       }
       const type = interaction.options.getString('type', true);
       const lang = interaction.options.getString('lang', true);
@@ -465,7 +473,7 @@ client.on('interactionCreate', async (interaction) => {
       const targetChannel = interaction.options.getChannel('channel') || (process.env.ANNOUNCE_CHANNEL_ID ? await interaction.client.channels.fetch(process.env.ANNOUNCE_CHANNEL_ID) : interaction.channel);
       const content = buildAnnouncement({ type, lang, title, when, details });
       await targetChannel.send({ content });
-      return interaction.reply({ content: lang === 'pl' ? '✅ Ogłoszenie wysłane.' : '✅ Announcement sent.', ephemeral: true });
+      return interaction.reply({ content: lang === 'pl' ? '✅ Ogłoszenie wysłane.' : '✅ Announcement sent.', flags: MessageFlags.Ephemeral });
     }
     // report
     if (interaction.commandName === 'report') {
@@ -473,22 +481,22 @@ client.on('interactionCreate', async (interaction) => {
       const details = interaction.options.getString('details', true);
       const reportsChannelId = process.env.REPORTS_CHANNEL_ID;
       if (!reportsChannelId) {
-        return interaction.reply({ content: '⚠️ Report channel is not configured.', ephemeral: true });
+        return interaction.reply({ content: '⚠️ Report channel is not configured.', flags: MessageFlags.Ephemeral });
       }
       try {
         const reportsChannel = await interaction.client.channels.fetch(reportsChannelId);
         await reportsChannel.send({ content: `🚨 **New Report**\nTitle: ${title}\nDetails: ${details}\nReporter: <@${interaction.user.id}>` });
-        return interaction.reply({ content: '✅ Zgłoszenie wysłane. Dzięki!', ephemeral: true });
+        return interaction.reply({ content: '✅ Zgłoszenie wysłane. Dzięki!', flags: MessageFlags.Ephemeral });
       } catch (e) {
         console.error('report send', e);
-        return interaction.reply({ content: '⚠️ Nie udało się wysłać zgłoszenia.', ephemeral: true });
+        return interaction.reply({ content: '⚠️ Nie udało się wysłać zgłoszenia.', flags: MessageFlags.Ephemeral });
       }
     }
     // reply-ferox
     if (interaction.commandName === 'reply-ferox') {
       const update = '🦖 **Ferox taming bug update**\nPL: Aktualizacja dotycząca błędu oswajania Feroxa została opublikowana. Sprawdź naszego Discorda lub patch notes, aby uzyskać więcej informacji.\nEN: The update regarding the Ferox taming bug has been published. Check our Discord or the patch notes for details.';
       await interaction.channel.send({ content: update });
-      return interaction.reply({ content: '✅ Update posted.', ephemeral: true });
+      return interaction.reply({ content: '✅ Update posted.', flags: MessageFlags.Ephemeral });
     }
 
     // read-channel
@@ -512,25 +520,25 @@ client.on('interactionCreate', async (interaction) => {
           lines.push(`**${author}**: ${content}`);
         }
         if (!lines.length) {
-          return interaction.reply({ content: '⚠️ No messages found in that channel.', ephemeral: true });
+          return interaction.reply({ content: '⚠️ No messages found in that channel.', flags: MessageFlags.Ephemeral });
         }
         let response = lines.join('\n');
         if (response.length > 1900) response = response.slice(-1900);
-        return interaction.reply({ content: response, allowedMentions: { parse: [] }, ephemeral: true });
+        return interaction.reply({ content: response, allowedMentions: { parse: [] }, flags: MessageFlags.Ephemeral });
       } catch (e) {
         console.error('read-channel', e);
-        return interaction.reply({ content: '⚠️ Failed to fetch messages (check permissions and intents).', ephemeral: true });
+        return interaction.reply({ content: '⚠️ Failed to fetch messages (check permissions and intents).', flags: MessageFlags.Ephemeral });
       }
     }
     // kb-add: add a document to the knowledge base
     if (interaction.commandName === 'kb-add') {
       const member = await interaction.guild.members.fetch(interaction.user.id);
       if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
-        return interaction.reply({ content: '⛔ Admin only.', ephemeral: true });
+        return interaction.reply({ content: '⛔ Admin only.', flags: MessageFlags.Ephemeral });
       }
       const title = interaction.options.getString('title', true);
       const content = interaction.options.getString('content', true);
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const r = await kbAddDoc({ title, text: content, source: 'manual', lang: 'en' });
       if (!r.ok) return interaction.editReply('❌ KB not configured (Qdrant).');
       return interaction.editReply(`✅ Added to KB: **${title}** (${r.chunks} chunks)`);
@@ -539,7 +547,7 @@ client.on('interactionCreate', async (interaction) => {
     // kb-search: search the knowledge base
     if (interaction.commandName === 'kb-search') {
       const q = interaction.options.getString('query', true);
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const hits = await kbSearch(q, 5);
       if (!hits.length) return interaction.editReply('No KB matches.');
       const lines = hits.map((h, i) => `**${i + 1}. ${h.title}** [${(h.score * 100) | 0}%]\n${h.text.slice(0, 300)}${h.text.length > 300 ? '…' : ''}`);
@@ -550,10 +558,10 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'kb-import-pins') {
       const member = await interaction.guild.members.fetch(interaction.user.id);
       if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
-        return interaction.reply({ content: '⛔ Admin only.', ephemeral: true });
+        return interaction.reply({ content: '⛔ Admin only.', flags: MessageFlags.Ephemeral });
       }
       const channel = interaction.options.getChannel('channel', true);
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       try {
         const pins = await channel.messages.fetchPinned();
         if (!pins.size) return interaction.editReply('No pinned messages.');
@@ -578,7 +586,7 @@ client.on('interactionCreate', async (interaction) => {
       const hasProRole = member.roles.cache.some(r => ALLOWED_PRO_ROLES.includes(r.name));
       const isOwnerHelper = member.roles.cache.some(r => r.name === 'Helper') && interaction.user.id === OWNER_ID;
       if (isPro && !hasProRole && !isOwnerHelper) {
-        return interaction.reply({ content: '⛔ Nie masz uprawnień do `/ask-pro`. Użyj `/ask`.', ephemeral: true });
+        return interaction.reply({ content: '⛔ Nie masz uprawnień do `/ask-pro`. Użyj `/ask`.', flags: MessageFlags.Ephemeral });
       }
       const msg = interaction.options.getString('message', true);
       const lang = detectLang(msg, interaction.user.id);
@@ -589,7 +597,7 @@ client.on('interactionCreate', async (interaction) => {
       const limit = canUse(interaction.user.id, isPro, isOwnerHelper);
       if (!limit.ok) {
         const reasonMsg = limit.reason === 'global' ? (lang === 'pl' ? 'Limit globalny wyczerpany.' : 'Global limit reached.') : (lang === 'pl' ? 'Twój limit został wykorzystany.' : 'Your personal limit has been reached.');
-        return interaction.reply({ content: `⛔ ${reasonMsg}`, ephemeral: true });
+        return interaction.reply({ content: `⛔ ${reasonMsg}`, flags: MessageFlags.Ephemeral });
       }
       await interaction.deferReply();
       try {
