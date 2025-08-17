@@ -1,739 +1,489 @@
+
+// index.js — Open AI Bot (Discord) with Qdrant KB
+// - Safer interaction handling (ack/respond) to avoid 10062 / 40060
+// - Reduced memory footprint via cache limits & sweepers
+// - KB: Qdrant (upsert/search), embeddings via OpenAI
+// - Commands: /status, /website, /ask, /ask-pro, /kb-add, /kb-search, /kb-import-pins, /read-channel
+// Node: ESM enabled via "type": "module" in package.json
+
 import 'dotenv/config';
-
-// Discord and HTTP libraries
-import {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  REST,
-  Routes,
-  SlashCommandBuilder,
-  ChannelType,
-  PermissionsBitField,
-  MessageFlags
-} from 'discord.js';
-import OpenAI from 'openai';
 import express from 'express';
-import fs from 'node:fs';
-import path from 'node:path';
-import { google } from 'googleapis';
-// Import the entire gamedig module as a namespace. The CommonJS module does not
-// provide a default export, so using `import * as Gamedig` avoids a runtime
-// SyntaxError in Node ESM.
-import * as Gamedig from 'gamedig';
+import axios from 'axios';
+import OpenAI from 'openai';
+import { QdrantClient } from '@qdrant/js-client-rest';
+import {
+  Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder, ChannelType,
+  PermissionFlagsBits, EmbedBuilder, MessageFlags, Options, time
+} from 'discord.js';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const Gamedig = require('gamedig');
 
-// Import knowledge base helpers. These will be used to initialize
-// the Qdrant vector store and perform KB operations (add/search docs).
-// When Qdrant is not configured, these functions will gracefully noop.
-import { kbReady, kbAddDoc, kbSearch } from './kb/kb.js';
+// --------------------------- Config ---------------------------
 
-/*
- * SGServers Discord Bot
- *
- * Rewritten to replace a truncated original file. Implements:
- * - ask / ask-pro commands using OpenAI
- * - report and reply-ferox commands
- * - language preferences, daily limits and logging
- * - status polling and announcements
- * - simple express server for Render
- */
+const TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.DISCORD_CLIENT_ID; // App ID
+const OWNER_ID = process.env.OWNER_ID || '';
+const STATUS_WEBSITE_URL = process.env.STATUS_WEBSITE_URL || process.env.WEBSITE_URL || '';
+const STATUS_SERVERS = (process.env.STATUS_SERVERS || '').trim(); // "Name|ip:port,Name2|ip:port"
+const QDRANT_URL = process.env.QDRANT_URL || '';
+const QDRANT_API_KEY = process.env.QDRANT_API_KEY || '';
+const KB_COLLECTION = process.env.KB_COLLECTION || 'sg_kb';
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
+const CHAT_MODEL = process.env.CHAT_MODEL || 'gpt-4o-mini';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 
-// ========= Config =========
-const ALLOWED_PRO_ROLES = ['admini', 'Community Helper', 'Mastercraft', 'Journeyman', 'Apprentice', 'Ramshackle'];
-const OWNER_ID = process.env.OWNER_DISCORD_ID || '';
-const MODELS = { ASK: 'gpt-4o-mini', PRO: 'gpt-4o' };
-const LIMITS = { GLOBAL_PER_DAY: 50, USER_PER_DAY: 5, ELEVATED_PER_DAY: 20 };
+const KB_TIMEOUT_MS = Number(process.env.KB_TIMEOUT_MS || 25_000);
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 35_000);
 
-// ========= Helpers =========
-function isBillingInactiveError(err) {
-  return (
-    err?.code === 'billing_not_active' ||
-    err?.error?.code === 'billing_not_active' ||
-    (err?.status === 429 && /billing/i.test(err?.error?.message || err?.message || ''))
-  );
-}
-async function safeReply(interaction, content, isEphemeral = true) {
-  try {
-    // Build an options object. If content is already an object (e.g. contains allowedMentions), merge it.
-    const options =
-      content && typeof content === 'object' && !Array.isArray(content)
-        ? { ...content }
-        : { content };
-    // Apply the Ephemeral flag when requested. Discord.js v14 deprecates the `ephemeral` field on interaction responses.
-    if (isEphemeral) options.flags = MessageFlags.Ephemeral;
-    if (interaction.deferred) return interaction.editReply(options);
-    if (interaction.replied) return interaction.followUp(options);
-    return interaction.reply(options);
-  } catch (e) {
-    console.error('safeReply', e);
-  }
-}
+const ALLOWED_PRO_ROLES = (process.env.ALLOWED_PRO_ROLES || 'Helper,Admin,Moderator,Owner')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-// ========= Utility functions =========
-// Timeout wrapper. Rejects the promise if it takes longer than `ms` milliseconds.
-// Timeout (in milliseconds) for knowledge base operations. If a call to the knowledge base
-// (e.g., generating embeddings or upserting/searching in Qdrant) takes longer than this,
-// it will be aborted and an error will be thrown. Adjust this value based on your
-// environment's network latency and typical response times.
-const KB_TIMEOUT_MS = 15000;
+// --------------------------- Express (health) ---------------------------
 
-/**
- * Wrap a promise with a timeout. If the underlying promise does not settle within
- * `ms` milliseconds, this returns a rejected promise with a timeout error. This
- * ensures that long-running operations (such as embedding generation or vector
- * database queries) do not block the bot forever.
- *
- * @param {Promise} promise The promise to wrap.
- * @param {number} ms Maximum allowed time in milliseconds.
- * @param {string} label A descriptive label used in the timeout error message.
- * @returns {Promise} A promise that resolves/rejects with the underlying
- *                    promise or rejects on timeout.
- */
-function withTimeout(promise, ms = KB_TIMEOUT_MS, label = 'operation') {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms)
-    ),
-  ]);
-}
+const app = express();
+const PORT = Number(process.env.PORT || 10000);
+app.get('/', (req, res) => res.status(200).send('OK'));
+app.listen(PORT, () => console.log(`🌐 Express server listening on port ${PORT}`));
 
-// ========= OpenAI =========
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-async function askLLM(model, system, user, messages = null) {
-  // If messages are provided, use them directly; otherwise build from system/user.
-  const payloadMessages = messages || [
-    { role: 'system', content: system },
-    { role: 'user', content: user }
-  ];
-  const r = await openai.chat.completions.create({
-    model,
-    temperature: 0.4,
-    max_tokens: 600,
-    messages: payloadMessages
-  });
-  return { text: r.choices?.[0]?.message?.content?.trim() || 'No response.', usage: r.usage };
-}
+// --------------------------- Discord client with memory-friendly cache ---------------------------
 
-// ========= Limits (in-memory) =========
-const userDaily = new Map();
-let globalDayKey = new Date().toISOString().slice(0, 10);
-let globalUsed = 0;
-function dayKeyNow() { return new Date().toISOString().slice(0, 10); }
-function resetIfNewDay() {
-  const k = dayKeyNow();
-  if (k !== globalDayKey) {
-    globalDayKey = k;
-    globalUsed = 0;
-    userDaily.clear();
-  }
-}
-function canUse(userId, elevated = false, isOwnerHelper = false) {
-  resetIfNewDay();
-  if (isOwnerHelper) return { ok: true };
-  if (globalUsed >= LIMITS.GLOBAL_PER_DAY) return { ok: false, reason: 'global' };
-  const e = userDaily.get(userId) || { used: 0, usedPro: 0 };
-  const per = elevated ? LIMITS.ELEVATED_PER_DAY : LIMITS.USER_PER_DAY;
-  const used = elevated ? e.usedPro : e.used;
-  if (used >= per) return { ok: false, reason: 'user' };
-  return { ok: true };
-}
-function consume(userId, elevated = false, isOwnerHelper = false) {
-  if (isOwnerHelper) return;
-  globalUsed++;
-  const e = userDaily.get(userId) || { used: 0, usedPro: 0 };
-  if (elevated) e.usedPro++; else e.used++;
-  userDaily.set(userId, e);
-}
-function remainingFor(userId, elevated = false) {
-  resetIfNewDay();
-  const e = userDaily.get(userId) || { used: 0, usedPro: 0 };
-  const per = elevated ? LIMITS.ELEVATED_PER_DAY : LIMITS.USER_PER_DAY;
-  const used = elevated ? e.usedPro : e.used;
-  return Math.max(0, per - used);
-}
-
-// ========= Logging =========
-const LOG_DIR = path.join(process.cwd(), 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'usage.csv');
-function ensureLogSetup() {
-  try {
-    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR);
-    const header = 'ts,guildId,channelId,userId,command,model,promptTokens,completionTokens,totalTokens,elevated,globalUsed,userUsed,userProUsed\n';
-    if (!fs.existsSync(LOG_FILE)) fs.writeFileSync(LOG_FILE, header);
-  } catch (e) {
-    console.error('log setup', e);
-  }
-}
-ensureLogSetup();
-function csv(val) {
-  if (val == null) return '""';
-  const s = String(val).replaceAll('"', '""');
-  return '"' + s + '"';
-}
-let sheetsClient = null;
-async function getSheets() {
-  if (sheetsClient) return sheetsClient;
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  const sheetId = process.env.GOOGLE_SHEETS_ID;
-  if (!raw || !sheetId) return null;
-  try {
-    let creds;
-    try { creds = JSON.parse(Buffer.from(raw, 'base64').toString('utf8')); }
-    catch { creds = JSON.parse(raw); }
-    const auth = new google.auth.JWT(creds.client_email, null, creds.private_key, ['https://www.googleapis.com/auth/spreadsheets']);
-    await auth.authorize();
-    const sheets = google.sheets({ version: 'v4', auth });
-    sheetsClient = { sheets, sheetId };
-    return sheetsClient;
-  } catch (e) {
-    console.error('sheets auth', e);
-    return null;
-  }
-}
-async function appendSheet(values) {
-  const cli = await getSheets();
-  if (!cli) return;
-  try {
-    await cli.sheets.spreadsheets.values.append({
-      spreadsheetId: cli.sheetId,
-      range: 'Usage!A1',
-      valueInputOption: 'USER_ENTERED',
-      requestBody: { values: [values] }
-    });
-  } catch (e) {
-    console.error('sheets append', e);
-  }
-}
-async function logToChannel(client, content) {
-  const chanId = process.env.LOG_CHANNEL_ID;
-  if (!chanId) return;
-  try {
-    const ch = await client.channels.fetch(chanId);
-    await ch.send({ content });
-  } catch (e) {
-    console.error('log channel', e);
-  }
-}
-async function logUsage({ client, ctx, command, model, usage, elevated }) {
-  const ts = new Date().toISOString();
-  const guildId = ctx.guild?.id || ctx.guildId || '';
-  const channelId = ctx.channel?.id || ctx.channelId || '';
-  const userId = ctx.user?.id || ctx.author?.id || '';
-  const e = userDaily.get(userId) || { used: 0, usedPro: 0 };
-  const row = [ts, guildId, channelId, userId, command, model, usage?.prompt_tokens || '', usage?.completion_tokens || '', usage?.total_tokens || '', elevated ? '1' : '0', globalUsed, e.used, e.usedPro].map(csv).join(',');
-  try { fs.appendFileSync(LOG_FILE, row + '\n'); } catch (err) { console.error('csv write', err); }
-  appendSheet([ts, guildId, channelId, userId, command, model, usage?.prompt_tokens || '', usage?.completion_tokens || '', usage?.total_tokens || '', elevated ? 1 : 0, globalUsed, e.used, e.usedPro]);
-  logToChannel(client, `🧾 **Log** ${command} by <@${userId}> | model ${model} | tokens: ${usage?.total_tokens ?? '?' } | global ${globalUsed}/${LIMITS.GLOBAL_PER_DAY}`);
-}
-
-// ========= Language preference =========
-const userLang = new Map();
-function detectLang(text, userId) {
-  const pref = userLang.get(userId);
-  if (pref) return pref;
-  return /[ąćęłńóśźż]/i.test(text) ? 'pl' : 'en';
-}
-
-// ========= Status =========
-function parsePairs(env) {
-  if (!env) return [];
-  return env.split(',').map((s) => s.trim()).filter(Boolean).map((p) => {
-    const [name, rest] = p.split('|');
-    return { name: name?.trim() || rest, value: rest?.trim() || '' };
-  });
-}
-function parseServerPairs(env) {
-  if (!env) return [];
-  return env.split(',').map((s) => s.trim()).filter(Boolean).map((p) => {
-    const [nameRaw, restRaw] = p.split('|');
-    const name = (nameRaw || '').trim();
-    let right = (restRaw || '').trim();
-    // Default type is ARK: Survival Evolved (GameDig id 'arkse'). We'll override
-    // this based on parameters or the server name.
-    let type = 'arkse';
-    let hintType = null;
-    // Check for semicolon parameters appended to the host:port part, e.g.
-    // "ip:port;type=ase". Only the first part before the semicolon is the
-    // host:port; subsequent parts are key=value parameters.
-    if (right.includes(';')) {
-      const parts = right.split(';').map((x) => x.trim()).filter(Boolean);
-      right = parts[0];
-      for (let i = 1; i < parts.length; i++) {
-        const [k, v] = parts[i].split('=');
-        if ((k || '').trim().toLowerCase() === 'type' && v) {
-          hintType = v.trim().toLowerCase();
-        }
-      }
-    }
-    // If no explicit type provided, attempt to derive from the server name
-    // (e.g. "DOX EASY (ASE)" => hintType = "ase").
-    if (!hintType) {
-      const match = name.match(/\(([^)]+)\)/);
-      if (match) {
-        hintType = match[1].trim().toLowerCase();
-      }
-    }
-    if (hintType) {
-      type = hintType;
-    }
-    // Normalize common synonyms. 'ase' and 'asa' both map to 'arkse'.
-    if (type === 'ase' || type === 'asa') type = 'arkse';
-    const [host, portStr] = right.split(':');
-    const port = Number(portStr);
-    return { name: name || right, host: (host || '').trim(), port, type };
-  });
-}
-async function queryGame(type, host, port) {
-  try {
-    const r = await Gamedig.query({ type, host, port: Number(port) });
-    const playerCount = Array.isArray(r.players) ? r.players.length : (r.players || 0);
-    return { ok: true, name: r.name, map: r.map, players: playerCount, max: r.maxplayers || 0, ping: r.ping };
-  } catch (e) { return { ok: false, error: String(e.message || e) }; }
-}
-async function queryHttp(url) {
-  try {
-    const res = await fetch(url, { method: 'GET' });
-    const ok = res.status >= 200 && res.status < 400;
-    return { ok, status: res.status };
-  } catch (e) { return { ok: false, error: String(e.message || e) }; }
-}
-const lastStatus = new Map();
-function iconForType(type) {
-  const t = (type || '').toLowerCase();
-  if (t === 'scum') return '🎯';
-  if (t === 'arkse') return '🦖';
-  return '🎮';
-}
-function iconForHttp() { return '🌐'; }
-async function buildStatusSummary() {
-  const serverDefs = parseServerPairs(process.env.STATUS_SERVERS);
-  const httpDefs = parsePairs(process.env.STATUS_HTTP_URLS);
-  const lines = [];
-  for (const d of serverDefs) {
-    if (!d.host || !d.port) { lines.push(`❔ **${d.name}** — invalid host/port`); continue; }
-    const r = await queryGame(d.type || 'arkse', d.host, d.port);
-    const icon = iconForType(d.type || 'arkse');
-    if (r.ok) lines.push(`✅ ${icon} **${d.name}** — ${r.players}/${r.max} players, ping ${r.ping}ms`);
-    else lines.push(`❌ ${icon} **${d.name}** — offline`);
-    lastStatus.set(`game:${d.type}:${d.name}`, r.ok);
-  }
-  for (const d of httpDefs) {
-    const r = await queryHttp(d.value);
-    const icon = iconForHttp();
-    if (r.ok) lines.push(`✅ ${icon} **${d.name}** — HTTP ${r.status}`);
-    else lines.push(`❌ ${icon} **${d.name}** — HTTP ${r.status ?? 'error'}`);
-    lastStatus.set(`http:${d.name}`, r.ok);
-  }
-  return lines.join('\n');
-}
-async function startAutoStatus() {
-  const chanId = process.env.STATUS_CHANNEL_ID;
-  if (!chanId) return;
-  const postIfChanged = async () => {
-    const chan = await client.channels.fetch(chanId);
-    const before = new Map(lastStatus);
-    const text = await buildStatusSummary();
-    let changed = !before.size;
-    for (const [k, v] of lastStatus) {
-      if (before.get(k) !== v) { changed = true; break; }
-    }
-    if (changed) {
-      await chan.send({ content: `📊 **Server status**\n${text}` });
-    }
-  };
-  setTimeout(postIfChanged, 10000);
-  setInterval(postIfChanged, 5 * 60 * 1000);
-}
-
-// ========= Announcements =========
-function userHasAnnouncePerm(member) {
-  try {
-    return member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
-           member.roles.cache.some(r => ALLOWED_PRO_ROLES.includes(r.name)) ||
-           (member.roles.cache.some(r => r.name === 'Helper') && member.id === OWNER_ID);
-  } catch { return false; }
-}
-function buildAnnouncement({ type, lang, title, when, details }) {
-  const isPL = lang === 'pl';
-  const lines = [];
-  if (type === 'event') lines.push(isPL ? `🎉 **Wydarzenie**: ${title}` : `🎉 **Event**: ${title}`);
-  else if (type === 'restart') lines.push(isPL ? `🔁 **Restart serwera**: ${title}` : `🔁 **Server restart**: ${title}`);
-  else lines.push(isPL ? `🛠 **Aktualizacja**: ${title}` : `🛠 **Update**: ${title}`);
-  if (when) lines.push(`🗓 ${when}`);
-  if (details) { lines.push(''); lines.push(details); }
-  return lines.join('\n');
-}
-
-// ========= Discord Client =========
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
-  partials: [Partials.Channel]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent, // needed for reading content in /read-channel (limited)
+  ],
+  partials: [Partials.Channel, Partials.Message],
+  makeCache: Options.cacheWithLimits({
+    ApplicationCommandManager: 0,
+    AutoModerationRuleManager: 0,
+    BaseGuildEmojiManager: 0,
+    GuildBanManager: 0,
+    GuildInviteManager: 0,
+    GuildStickerManager: 0,
+    PresenceManager: 0,
+    ReactionManager: 0,
+    VoiceStateManager: 0,
+    // keep modest caches:
+    GuildMemberManager: { maxSize: 100 },
+    MessageManager: { maxSize: 50 },
+    ThreadManager: { maxSize: 10 },
+  }),
+  sweepers: {
+    messages: { interval: 5 * 60, lifetime: 15 * 60 },
+    users:    { interval: 60 * 60, filter: () => user => !user.bot },
+    threads:  { interval: 60 * 60, lifetime: 60 * 60 },
+  }
 });
 
-// ========= Slash Commands =========
+// Optional memory logger (off by default)
+if (process.env.MEMLOG === '1') {
+  setInterval(() => {
+    const m = process.memoryUsage();
+    console.log(`[mem] rss=${(m.rss/1e6).toFixed(0)}MB heap=${(m.heapUsed/1e6).toFixed(0)}/${(m.heapTotal/1e6).toFixed(0)}MB ext=${(m.external/1e6).toFixed(0)}MB`);
+  }, 60_000);
+}
+
+// --------------------------- Helpers: ack/respond, timeout ---------------------------
+
+async function ack(interaction, flags = MessageFlags.Ephemeral) {
+  try {
+    if (interaction.deferred || interaction.replied) return false;
+    await interaction.deferReply({ flags });
+    return true;
+  } catch (e) {
+    const code = e?.code || e?.rawError?.code;
+    console.warn('[ack] failed', code, e?.message || e);
+    return false;
+  }
+}
+
+async function respond(interaction, payload) {
+  try {
+    if (interaction.deferred) return await interaction.editReply(payload);
+    if (interaction.replied)  return await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
+    return await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
+  } catch (e) {
+    const code = e?.code || e?.rawError?.code;
+    if (code === 40060) { // already acknowledged
+      try { return await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral }); } catch {}
+    }
+    console.error('[respond] error', e);
+  }
+}
+
+function withTimeout(promise, ms, label = 'op') {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
+}
+
+// --------------------------- OpenAI and Embeddings ---------------------------
+
+let openai = null;
+if (OPENAI_API_KEY) {
+  try {
+    openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+  } catch (e) {
+    console.warn('OpenAI init failed:', e);
+  }
+}
+
+// Chunking helper for embeddings
+function chunkText(text, chunkSize = 1200, overlap = 150) {
+  const chunks = [];
+  let i = 0;
+  while (i < text.length) {
+    const end = Math.min(i + chunkSize, text.length);
+    chunks.push(text.slice(i, end));
+    if (end === text.length) break;
+    i = end - overlap;
+  }
+  return chunks;
+}
+
+async function embed(texts) {
+  if (!openai) throw new Error('OPENAI_API_KEY not set');
+  const res = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: texts });
+  return res.data.map(d => d.embedding);
+}
+
+// --------------------------- Qdrant ---------------------------
+
+let qdrant = null;
+let KB_READY = false;
+if (QDRANT_URL) {
+  try {
+    qdrant = new QdrantClient({ url: QDRANT_URL, apiKey: QDRANT_API_KEY || undefined });
+    // Ensure collection exists (1536 dims for text-embedding-3-small)
+    const dim = 1536;
+    const exists = await qdrant.getCollections().then(r => r.collections.find(c => c.name === KB_COLLECTION)).catch(() => null);
+    if (!exists) {
+      await qdrant.createCollection(KB_COLLECTION, { vectors: { size: dim, distance: 'Cosine' } });
+      console.log(`[KB] Created collection ${KB_COLLECTION}`);
+    }
+    KB_READY = true;
+    console.log('📚 KB (Qdrant) ready.');
+  } catch (e) {
+    console.warn('[KB] init failed:', e?.message || e);
+  }
+} else {
+  console.log('[KB] QDRANT_URL not set. Knowledge features will be disabled.');
+}
+
+// Upsert to KB
+async function kbUpsert(items) {
+  if (!KB_READY) throw new Error('KB not ready');
+  const points = items.map((it, idx) => ({
+    id: it.id || undefined,
+    vector: it.vec,
+    payload: { title: it.title, content: it.content, author: it.author || null, ts: it.ts || Date.now() }
+  }));
+  await qdrant.upsert(KB_COLLECTION, { wait: true, points });
+}
+
+// Search KB
+async function kbSearch(query, limit = 5) {
+  if (!KB_READY) return [];
+  const [vec] = await embed([query]);
+  const res = await qdrant.search(KB_COLLECTION, { vector: vec, limit });
+  return res.map(r => ({ score: r.score, ...r.payload }));
+}
+
+// --------------------------- Gamedig: status ---------------------------
+
+function parseServers(envStr) {
+  return envStr.split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(pair => {
+      const [name, addr] = pair.split('|').map(x => x.trim());
+      return { name, addr };
+    });
+}
+
+async function queryArk(addr) {
+  const [host, portStr] = addr.split(':');
+  const port = Number(portStr);
+  try {
+    const res = await Gamedig.query({ type: 'arkse', host, port, maxRetries: 1, socketTimeout: 2500 });
+    return { online: true, name: res.name || '', players: res.players?.length || 0, maxplayers: res.maxplayers || 0, map: res.map || '' };
+  } catch {
+    return { online: false };
+  }
+}
+
+// --------------------------- Slash commands ---------------------------
+
 const commands = [
-  new SlashCommandBuilder().setName('ask').setDescription('Ask the SGServers AI bot (gpt-4o-mini)').addStringOption(o => o.setName('message').setDescription('Your question').setRequired(true)),
-  new SlashCommandBuilder().setName('ask-pro').setDescription('Ask the SGServers AI bot (gpt-4o)').addStringOption(o => o.setName('message').setDescription('Your question').setRequired(true)),
-  new SlashCommandBuilder().setName('report').setDescription('Submit a server issue report to admins.').addStringOption(o => o.setName('title').setDescription('Short title').setRequired(true)).addStringOption(o => o.setName('details').setDescription('Describe the problem').setRequired(true)),
-  new SlashCommandBuilder().setName('reply-ferox').setDescription('Post the prepared Ferox taming bug update for players.'),
-  new SlashCommandBuilder().setName('set-lang').setDescription('Set your preferred language for bot responses.').addStringOption(o => o.setName('language').setDescription('pl or en').setRequired(true).addChoices({ name: 'Polski', value: 'pl' }, { name: 'English', value: 'en' })),
-  new SlashCommandBuilder().setName('limits').setDescription('Show your remaining daily limits'),
-  new SlashCommandBuilder().setName('status').setDescription('Show SGServers status (ARK/HTTP) now.'),
-  new SlashCommandBuilder().setName('announce').setDescription('Post a templated announcement (PL/EN).')
-    .addStringOption(o => o.setName('type').setDescription('Template type').setRequired(true).addChoices({ name: 'event', value: 'event' }, { name: 'update', value: 'update' }, { name: 'restart', value: 'restart' }))
-    .addStringOption(o => o.setName('lang').setDescription('Language').setRequired(true).addChoices({ name: 'Polski', value: 'pl' }, { name: 'English', value: 'en' }))
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('Check ARK servers & website status'),
+
+  new SlashCommandBuilder()
+    .setName('website')
+    .setDescription('Check website HTTP status'),
+
+  new SlashCommandBuilder()
+    .setName('kb-add')
+    .setDescription('Add a note to the knowledge base')
     .addStringOption(o => o.setName('title').setDescription('Title').setRequired(true))
-    .addStringOption(o => o.setName('when').setDescription('When? (optional)'))
-    .addStringOption(o => o.setName('details').setDescription('Details (optional)'))
-    .addChannelOption(o => o.setName('channel').setDescription('Target channel (optional)').addChannelTypes(ChannelType.GuildText)),
-  // Command to read recent messages from a channel. This command allows
-  // moderators or users with appropriate permissions to fetch the latest
-  // messages in a text channel. The bot must have the View Channel and
-  // Read Message History permissions, along with the Message Content
-  // intent enabled, for this to work. A limit option caps the number
-  // of messages retrieved.
+    .addStringOption(o => o.setName('content').setDescription('Content').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('kb-search')
+    .setDescription('Search the knowledge base')
+    .addStringOption(o => o.setName('query').setDescription('Your query').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('kb-import-pins')
+    .setDescription('Import pinned messages from a channel to KB')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel').addChannelTypes(ChannelType.GuildText).setRequired(true)),
+
   new SlashCommandBuilder()
     .setName('read-channel')
-    .setDescription('Read recent messages from a channel (default: current channel).')
-    .addChannelOption(o =>
-      o
-        .setName('channel')
-        .setDescription('Channel to read (defaults to the current channel)')
-        .addChannelTypes(ChannelType.GuildText)
-    )
-    .addIntegerOption(o =>
-      o
-        .setName('limit')
-        .setDescription('Number of messages to retrieve (1-50, defaults to 10)')
-        .setRequired(false)
-    )
+    .setDescription('Read last N messages from a channel (no store)')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel').addChannelTypes(ChannelType.GuildText).setRequired(true))
+    .addIntegerOption(o => o.setName('limit').setDescription('How many (max 500)').setRequired(false)),
 
-  // Knowledge base commands
-  , new SlashCommandBuilder()
-    .setName('kb-add')
-    .setDescription('Add a knowledge entry to the vector KB.')
-    .addStringOption(o => o.setName('title').setDescription('Title').setRequired(true))
-    .addStringOption(o => o.setName('content').setDescription('Content').setRequired(true))
-  , new SlashCommandBuilder()
-    .setName('kb-search')
-    .setDescription('Search the knowledge base (preview).')
-    .addStringOption(o => o.setName('query').setDescription('What to search for').setRequired(true))
-  , new SlashCommandBuilder()
-    .setName('kb-import-pins')
-    .setDescription('Import pinned messages from a channel into KB.')
-    .addChannelOption(o =>
-      o
-        .setName('channel')
-        .setDescription('Channel')
-        .setRequired(true)
-        .addChannelTypes(ChannelType.GuildText)
-    )
+  new SlashCommandBuilder()
+    .setName('ask')
+    .setDescription('Ask with KB context')
+    .addStringOption(o => o.setName('question').setDescription('Your question').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('ask-pro')
+    .setDescription('Ask with KB context (pro – needs role)')
+    .addStringOption(o => o.setName('question').setDescription('Your question').setRequired(true)),
 ].map(c => c.toJSON());
 
-async function registerCommands() {
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
-  const app = await client.application?.fetch();
-  const appId = app?.id;
-  if (!appId) throw new Error('Cannot determine application ID');
-  await rest.put(Routes.applicationCommands(appId), { body: commands });
-  console.log('✅ Slash commands registered globally.');
-}
-
+// Register global commands once on ready
 client.once('ready', async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
-  try { await registerCommands(); } catch (e) { console.error('Register commands', e); }
-  try { startAutoStatus(); } catch (e) { console.error('auto-status', e); }
-
-  // Initialize the vector knowledge base. When no Qdrant URL/API key are provided,
-  // the KB functions will noop and return false. We log the result for clarity.
   try {
-    const ok = await kbReady();
-    console.log(ok ? '📚 KB (Qdrant) ready.' : '📚 KB disabled (no QDRANT_URL).');
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log('✅ Slash commands registered globally.');
   } catch (e) {
-    console.error('KB init', e);
+    console.error('Failed to register slash commands:', e);
   }
 });
 
-// ========= Interaction handler =========
+// --------------------------- Interaction handler ---------------------------
+
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
+
   try {
-    // set-lang
-    if (interaction.commandName === 'set-lang') {
-      const lang = interaction.options.getString('language', true);
-      userLang.set(interaction.user.id, lang);
-      return interaction.reply({ content: lang === 'pl' ? '✅ Ustawiono język na **polski**.' : '✅ Language set to **English**.', flags: MessageFlags.Ephemeral });
-    }
-    // limits
-    if (interaction.commandName === 'limits') {
-      resetIfNewDay();
-      const member = interaction.member;
-      const hasProRole = member?.roles?.cache?.some(r => ALLOWED_PRO_ROLES.includes(r.name)) || false;
-	  const isOwnerHelper = member?.roles?.cache?.some(r => r.name === 'Helper') && interaction.user.id === OWNER_ID;
-      const remUser = remainingFor(interaction.user.id, false);
-      const remPro = hasProRole ? remainingFor(interaction.user.id, true) : 0;
-      const remGlobal = Math.max(0, LIMITS.GLOBAL_PER_DAY - globalUsed);
-      const lines = [
-        `Global left: **${remGlobal}/${LIMITS.GLOBAL_PER_DAY}**`,
-        `Your /ask left: **${remUser}/${LIMITS.USER_PER_DAY}**`
-      ];
-      if (hasProRole) lines.push(`Your /ask-pro left: **${remPro}/${LIMITS.ELEVATED_PER_DAY}**`);
-      if (isOwnerHelper) lines.push('(Helper bypass active)');
-      return interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
-    }
-    // status
+    // /status
     if (interaction.commandName === 'status') {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const text = await buildStatusSummary();
-      return interaction.editReply(text || 'No status sources configured.');
-    }
-    // announce
-    if (interaction.commandName === 'announce') {
-      const member = interaction.member;
-      if (!userHasAnnouncePerm(member)) {
-        return interaction.reply({ content: '⛔ Brak uprawnień do ogłoszeń.', flags: MessageFlags.Ephemeral });
+      await ack(interaction);
+      const lines = [];
+
+      if (STATUS_SERVERS) {
+        const servers = parseServers(STATUS_SERVERS);
+        for (const s of servers) {
+          const st = await withTimeout(queryArk(s.addr), 4500, 'gamedig');
+          if (st.online) {
+            lines.push(`🟢 **${s.name}** — ${st.players}/${st.maxplayers} players (${st.map || 'map?'})`);
+          } else {
+            lines.push(`❌ **${s.name}** — offline`);
+          }
+        }
+      } else {
+        lines.push('ℹ️ No STATUS_SERVERS env configured.');
       }
-      const type = interaction.options.getString('type', true);
-      const lang = interaction.options.getString('lang', true);
-      const title = interaction.options.getString('title', true);
-      const when = interaction.options.getString('when');
-      const details = interaction.options.getString('details');
-      const targetChannel = interaction.options.getChannel('channel') || (process.env.ANNOUNCE_CHANNEL_ID ? await interaction.client.channels.fetch(process.env.ANNOUNCE_CHANNEL_ID) : interaction.channel);
-      const content = buildAnnouncement({ type, lang, title, when, details });
-      await targetChannel.send({ content });
-      return interaction.reply({ content: lang === 'pl' ? '✅ Ogłoszenie wysłane.' : '✅ Announcement sent.', flags: MessageFlags.Ephemeral });
-    }
-    // report
-    if (interaction.commandName === 'report') {
-      const title = interaction.options.getString('title', true);
-      const details = interaction.options.getString('details', true);
-      const reportsChannelId = process.env.REPORTS_CHANNEL_ID;
-      if (!reportsChannelId) {
-        return interaction.reply({ content: '⚠️ Report channel is not configured.', flags: MessageFlags.Ephemeral });
+
+      if (STATUS_WEBSITE_URL) {
+        try {
+          const res = await withTimeout(axios.get(STATUS_WEBSITE_URL, { timeout: 4000 }), 4500, 'website');
+          lines.push(`✅ **Website** — HTTP ${res.status}`);
+        } catch {
+          lines.push(`❌ **Website** — offline`);
+        }
       }
-      try {
-        const reportsChannel = await interaction.client.channels.fetch(reportsChannelId);
-        await reportsChannel.send({ content: `🚨 **New Report**\nTitle: ${title}\nDetails: ${details}\nReporter: <@${interaction.user.id}>` });
-        return interaction.reply({ content: '✅ Zgłoszenie wysłane. Dzięki!', flags: MessageFlags.Ephemeral });
-      } catch (e) {
-        console.error('report send', e);
-        return interaction.reply({ content: '⚠️ Nie udało się wysłać zgłoszenia.', flags: MessageFlags.Ephemeral });
-      }
-    }
-    // reply-ferox
-    if (interaction.commandName === 'reply-ferox') {
-      const update = '🦖 **Ferox taming bug update**\nPL: Aktualizacja dotycząca błędu oswajania Feroxa została opublikowana. Sprawdź naszego Discorda lub patch notes, aby uzyskać więcej informacji.\nEN: The update regarding the Ferox taming bug has been published. Check our Discord or the patch notes for details.';
-      await interaction.channel.send({ content: update });
-      return interaction.reply({ content: '✅ Update posted.', flags: MessageFlags.Ephemeral });
+
+      const embed = new EmbedBuilder()
+        .setTitle('Server status')
+        .setDescription(lines.join('\n'))
+        .setColor(0x2b8a3e)
+        .setTimestamp(new Date());
+
+      return respond(interaction, { embeds: [embed] });
     }
 
-    // read-channel
-    if (interaction.commandName === 'read-channel') {
-      // Read recent messages from a specified channel. Defaults to the current
-      // channel if none is provided. The bot must have View Channel, Read
-      // Message History permissions and the Message Content intent enabled.
-      const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
-      let limit = interaction.options.getInteger('limit');
-      if (!limit || isNaN(limit)) limit = 10;
-      limit = Math.min(50, Math.max(1, limit));
+    // /website
+    if (interaction.commandName === 'website') {
+      await ack(interaction);
+      if (!STATUS_WEBSITE_URL) return respond(interaction, { content: 'No STATUS_WEBSITE_URL set.' });
       try {
-        const fetched = await targetChannel.messages.fetch({ limit });
-        const sorted = Array.from(fetched.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-        const lines = [];
-        for (const msg of sorted) {
-          const author = msg.author?.tag || msg.author?.username || 'Unknown';
-          let content = msg.content?.toString() || '';
-          if (!content.trim()) content = '(embed/attachment)';
-          if (content.length > 200) content = content.slice(0, 197) + '...';
-          lines.push(`**${author}**: ${content}`);
-        }
-        if (!lines.length) {
-          return interaction.reply({ content: '⚠️ No messages found in that channel.', flags: MessageFlags.Ephemeral });
-        }
-        let response = lines.join('\n');
-        if (response.length > 1900) response = response.slice(-1900);
-        return interaction.reply({ content: response, allowedMentions: { parse: [] }, flags: MessageFlags.Ephemeral });
+        const res = await withTimeout(axios.get(STATUS_WEBSITE_URL, { timeout: 4000 }), 4500, 'website');
+        return respond(interaction, { content: `✅ Website — HTTP ${res.status}` });
       } catch (e) {
-        console.error('read-channel', e);
-        return interaction.reply({ content: '⚠️ Failed to fetch messages (check permissions and intents).', flags: MessageFlags.Ephemeral });
+        return respond(interaction, { content: `❌ Website offline (${e?.message || e})` });
       }
     }
-    // kb-add: add a document to the knowledge base
+
+    // /kb-add
     if (interaction.commandName === 'kb-add') {
-      // Defer the reply immediately to prevent timeouts and use flags instead of deprecated `ephemeral`.
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      // Check permissions using memberPermissions. Avoid fetching guild members, which requires an extra intent.
-      const perms = interaction.memberPermissions ?? interaction.member?.permissions;
-      if (!perms?.has(PermissionsBitField.Flags.ManageGuild)) {
-        return interaction.editReply('⛔ Admin only.');
-      }
+      await ack(interaction);
+      if (!KB_READY) return respond(interaction, { content: 'KB disabled (no QDRANT_URL).' });
       const title = interaction.options.getString('title', true);
       const content = interaction.options.getString('content', true);
-      try {
-        // Wrap kbAddDoc in a timeout to ensure the bot does not hang indefinitely.
-        const r = await withTimeout(
-          kbAddDoc({ title, text: content, source: 'manual', lang: 'en' }),
-          KB_TIMEOUT_MS,
-          'kbAddDoc'
-        );
-        if (!r.ok) return interaction.editReply('❌ KB not configured (Qdrant).');
-        return interaction.editReply(`✅ Added to KB: **${title}** (${r.chunks} chunks)`);
-      } catch (e) {
-        console.error('[kb-add]', e);
-        const msg = (e?.message || String(e)).slice(0, 400);
-        return interaction.editReply(`❌ KB error: ${msg}`);
+
+      const MAX_ADD_CHARS = 20_000;
+      if (content.length > MAX_ADD_CHARS) {
+        return respond(interaction, { content: `⛔ Content too big (${content.length}). Max ${MAX_ADD_CHARS}.` });
       }
+
+      if (!OPENAI_API_KEY) return respond(interaction, { content: '⛔ No OPENAI_API_KEY set for embeddings.' });
+
+      const chunks = chunkText(content);
+      const BATCH = 32;
+      let inserted = 0;
+      for (let i = 0; i < chunks.length; i += BATCH) {
+        const slice = chunks.slice(i, i + BATCH);
+        const vecs = await withTimeout(embed(slice), KB_TIMEOUT_MS, 'embed');
+        const items = vecs.map((vec, idx) => ({
+          title,
+          content: slice[idx],
+          vec,
+          author: interaction.user.tag,
+          ts: Date.now()
+        }));
+        await kbUpsert(items);
+        inserted += items.length;
+      }
+      return respond(interaction, { content: `✅ Added to KB: **${title}** (${inserted} chunks).` });
     }
 
-    // kb-search: search the knowledge base
+    // /kb-search
     if (interaction.commandName === 'kb-search') {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await ack(interaction);
+      if (!KB_READY) return respond(interaction, { content: 'KB disabled (no QDRANT_URL).' });
+      const query = interaction.options.getString('query', true);
       try {
-        const q = interaction.options.getString('query', true);
-        // Wrap kbSearch in a timeout to prevent long-running operations from causing timeouts.
-        const hits = await withTimeout(
-          kbSearch(q, 5),
-          KB_TIMEOUT_MS,
-          'kbSearch'
-        );
-        if (!hits?.length) return interaction.editReply('⚠️ Brak trafień.');
-        const lines = hits.map((h, i) =>
-          `**${i + 1}. ${h.title || '—'}** (score: ${h.score?.toFixed(3) ?? '?'})\n` +
-          `${(h.text || '').slice(0, 300)}${(h.text || '').length > 300 ? '…' : ''}`
-        );
-        return interaction.editReply(lines.join('\n\n'));
+        const hits = await withTimeout(kbSearch(query, 5), KB_TIMEOUT_MS, 'kbSearch');
+        if (!hits.length) return respond(interaction, { content: 'No results.' });
+        const lines = hits.map((h, i) => `**${i+1}. ${h.title || '(no title)'}** – ${(h.content || '').slice(0, 140)}…  _score:${h.score.toFixed(3)}_`);
+        return respond(interaction, { content: lines.join('\n') });
       } catch (e) {
-        console.error('[kb-search]', e);
-        const msg = (e?.message || String(e)).slice(0, 400);
-        return interaction.editReply(`❌ KB error: ${msg}`);
+        return respond(interaction, { content: `⛔ ${e?.message || e}` });
       }
     }
 
-    // kb-import-pins: import pinned messages from a channel into the KB
+    // /kb-import-pins
     if (interaction.commandName === 'kb-import-pins') {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await ack(interaction);
+      if (!KB_READY) return respond(interaction, { content: 'KB disabled (no QDRANT_URL).' });
+      if (!OPENAI_API_KEY) return respond(interaction, { content: '⛔ No OPENAI_API_KEY for embeddings.' });
+
+      const channel = interaction.options.getChannel('channel', true);
+      if (channel.type !== ChannelType.GuildText) return respond(interaction, { content: 'Choose a text channel.' });
+
+      const pins = await channel.messages.fetchPinned();
+      if (!pins.size) return respond(interaction, { content: 'No pinned messages.' });
+
+      const texts = pins.map(m => `Author: ${m.author?.tag}\nDate: ${m.createdAt?.toISOString()}\n\n${m.content || ''}`);
+      const chunks = texts.flatMap(t => chunkText(t));
+      const BATCH = 32;
+      let inserted = 0;
+      for (let i = 0; i < chunks.length; i += BATCH) {
+        const slice = chunks.slice(i, i + BATCH);
+        const vecs = await withTimeout(embed(slice), KB_TIMEOUT_MS, 'embed');
+        const items = vecs.map((vec, idx) => ({
+          title: `Pin from #${channel.name}`,
+          content: slice[idx],
+          vec,
+          author: interaction.user.tag,
+          ts: Date.now()
+        }));
+        await kbUpsert(items);
+        inserted += items.length;
+      }
+      return respond(interaction, { content: `✅ Imported ${inserted} chunks from pinned messages.` });
+    }
+
+    // /read-channel
+    if (interaction.commandName === 'read-channel') {
+      await ack(interaction);
+      const channel = interaction.options.getChannel('channel', true);
+      const limit = Math.min(Math.max(interaction.options.getInteger('limit') || 200, 1), 500);
+      if (channel.type !== ChannelType.GuildText) return respond(interaction, { content: 'Choose a text channel.' });
+
+      let fetched = 0, lastId = undefined;
+      while (fetched < limit) {
+        const page = await channel.messages.fetch({ limit: Math.min(100, limit - fetched), before: lastId });
+        if (page.size === 0) break;
+        lastId = page.last().id;
+        fetched += page.size;
+      }
+      return respond(interaction, { content: `📖 Read ${fetched} messages from #${channel.name} (preview disabled).` });
+    }
+
+    // /ask & /ask-pro
+    if (interaction.commandName === 'ask' || interaction.commandName === 'ask-pro') {
+      await ack(interaction);
+      const isPro = interaction.commandName === 'ask-pro';
+      const member = interaction.member; // no GuildMembers intent
+      const hasProRole = member?.roles?.cache?.some(r => ALLOWED_PRO_ROLES.includes(r.name)) || false;
+      const canPro = hasProRole || (interaction.user.id === OWNER_ID);
+
+      if (isPro && !canPro) {
+        return respond(interaction, { content: '⛔ /ask-pro requires a pro role.' });
+      }
+      const question = interaction.options.getString('question', true);
+
+      // KB context
+      let contexts = [];
+      if (KB_READY && OPENAI_API_KEY) {
+        try {
+          const hits = await withTimeout(kbSearch(question, isPro ? 8 : 5), KB_TIMEOUT_MS, 'kbSearch');
+          contexts = hits.map(h => `Title: ${h.title}\nContent: ${h.content}`);
+        } catch (e) {
+          console.warn('kbSearch failed:', e?.message || e);
+        }
+      }
+
+      // If no OpenAI key, just return KB snippets
+      if (!openai) {
+        const reply = contexts.length
+          ? `🔎 KB snippets:\n\n${contexts.slice(0, 3).map((c, i) => `**${i+1}.** ${c.slice(0, 300)}…`).join('\n\n')}`
+          : 'ℹ️ OPENAI_API_KEY not set; returning KB snippets disabled.';
+        return respond(interaction, { content: reply });
+      }
+
+      // Build prompt
+      const sys = `You are a helpful assistant for ARK/ASA game servers. Answer briefly and use KB context if relevant. If unsure, say you are unsure.`;
+      const user = `Question:\n${question}\n\nKB Context:\n${contexts.join('\n\n')}`.slice(0, 12_000);
+
       try {
-        const perms = interaction.memberPermissions ?? interaction.member?.permissions;
-        if (!perms?.has(PermissionsBitField.Flags.ManageGuild)) {
-          return interaction.editReply('⛔ Admin only.');
-        }
-        const channel = interaction.options.getChannel('channel', true);
-        const pins = await channel.messages.fetchPinned();
-        if (!pins?.size) return interaction.editReply('⚠️ Brak przypiętych wiadomości.');
-        let ok = 0, fail = 0;
-        for (const msg of pins.values()) {
-          if (msg.author?.bot) continue;
-          const text = msg.cleanContent?.trim();
-          if (!text) continue;
-          try {
-            const title = (text.split('\n')[0] || 'Pin').slice(0, 80);
-            await withTimeout(
-              kbAddDoc({
-                title,
-                text,
-                lang: 'en',
-                source: msg.url
-              }),
-              KB_TIMEOUT_MS,
-              'kbAddDoc'
-            );
-            ok++;
-          } catch {
-            fail++;
-          }
-        }
-        return interaction.editReply(`📌 Zaimportowano z #${channel.name}: **${ok}** OK, **${fail}** błędów.`);
+        const completion = await withTimeout(openai.chat.completions.create({
+          model: CHAT_MODEL,
+          messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
+          temperature: 0.2,
+        }), LLM_TIMEOUT_MS, 'chat');
+
+        const text = completion.choices?.[0]?.message?.content?.trim() || 'No answer.';
+        return respond(interaction, { content: text.slice(0, 1900) });
       } catch (e) {
-        console.error('[kb-import-pins]', e);
-        const msg = (e?.message || String(e)).slice(0, 400);
-        return interaction.editReply(`❌ KB error: ${msg}`);
+        return respond(interaction, { content: `⛔ LLM error: ${e?.message || e}` });
       }
     }
 
-    // ask / ask-pro
-    if (interaction.commandName === 'ask' || interaction.commandName === 'ask-pro') {
-      const isPro = interaction.commandName === 'ask-pro';
-      const member = interaction.member;
-      const hasProRole = member.roles.cache.some(r => ALLOWED_PRO_ROLES.includes(r.name));
-      const isOwnerHelper = member.roles.cache.some(r => r.name === 'Helper') && interaction.user.id === OWNER_ID;
-      if (isPro && !hasProRole && !isOwnerHelper) {
-        return interaction.reply({ content: '⛔ Nie masz uprawnień do `/ask-pro`. Użyj `/ask`.', flags: MessageFlags.Ephemeral });
-      }
-      const msg = interaction.options.getString('message', true);
-      const lang = detectLang(msg, interaction.user.id);
-      const system = lang === 'pl'
-        ? (isPro ? 'Jesteś Lumenem, profesjonalnym pomocnikiem Discord SGServers. Odpowiadaj szczegółowo i precyzyjnie po polsku.' : 'Jesteś Lumenem, pomocnym asystentem Discord SGServers. Odpowiadaj krótko, po polsku, rzeczowo i przyjaźnie.')
-        : (isPro ? 'You are Lumen, a professional assistant for the SGServers Discord. Answer thoroughly and precisely in English.' : 'You are Lumen, a helpful assistant for the SGServers Discord. Answer briefly, politely, and to the point in English.');
-      const model = isPro ? MODELS.PRO : MODELS.ASK;
-      const limit = canUse(interaction.user.id, isPro, isOwnerHelper);
-      if (!limit.ok) {
-        const reasonMsg = limit.reason === 'global' ? (lang === 'pl' ? 'Limit globalny wyczerpany.' : 'Global limit reached.') : (lang === 'pl' ? 'Twój limit został wykorzystany.' : 'Your personal limit has been reached.');
-        return interaction.reply({ content: `⛔ ${reasonMsg}`, flags: MessageFlags.Ephemeral });
-      }
-      await interaction.deferReply();
-      try {
-        // Perform a knowledge-base search for context
-        const hits = await withTimeout(kbSearch(msg, 5), KB_TIMEOUT_MS, 'kbSearch');
-        const context = hits
-          .map((d, i) => `#${i + 1} ${d.title} (s=${d.score !== undefined ? d.score.toFixed(2) : '0.00'}, src=${d.source})\n${d.text}`)
-          .join('\n\n');
-        // Build chat messages with explicit rules and context
-        const messages = [
-          {
-            role: 'system',
-            content: `${system}\n\nRULES:\n- Answer ONLY using provided Context.\n- If Context lacks the answer, say you don't know and suggest /status or #announcements.\n- Be concise.`
-          },
-          {
-            role: 'user',
-            content: `Context:\n${context || '(no context)'}\n\nQuestion:\n${msg}`
-          }
-        ];
-        const { text, usage } = await askLLM(model, null, null, messages);
-        consume(interaction.user.id, isPro, isOwnerHelper);
-        await logUsage({ client, ctx: interaction, command: interaction.commandName, model, usage, elevated: isPro });
-        return interaction.editReply(text);
-      } catch (e) {
-        console.error('ask', e);
-        if (isBillingInactiveError(e)) {
-          return safeReply(
-            interaction,
-            lang === 'pl'
-              ? '⚠️ Nasza subskrypcja OpenAI jest nieaktywna. Spróbuj ponownie później.'
-              : '⚠️ Our OpenAI subscription is inactive. Please try again later.',
-            true
-          );
-        }
-        return safeReply(
-          interaction,
-          lang === 'pl'
-            ? '⚠️ Wystąpił błąd podczas przetwarzania twojego zapytania.'
-            : '⚠️ An error occurred while processing your request.',
-          true
-        );
-      }
-    }
-  } catch (e) {
-    console.error('interaction handler', e);
-    try { await safeReply(interaction, '⚠️ An unexpected error occurred.', true); } catch (err) { console.error('error replying', err); }
+  } catch (err) {
+    console.error('interaction handler', err);
+    try { await respond(interaction, { content: `⛔ Error: ${err?.message || err}` }); } catch {}
   }
 });
 
-// ========= Start the bot and HTTP server =========
-const app = express();
-app.get('/', (req, res) => res.send('OK'));
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`🌐 Express server listening on port ${port}`);
-});
-client.login(process.env.DISCORD_BOT_TOKEN).catch((e) => {
-  console.error('Discord login failed', e);
-});
+// --------------------------- Login ---------------------------
 
-// Catch global unhandled promise rejections and uncaught exceptions to prevent crashes and log errors.
-process.on('unhandledRejection', (reason) => {
-  console.error('[unhandledRejection]', reason);
-});
-process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err);
-});
+if (!TOKEN || !CLIENT_ID) {
+  console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID env.');
+  process.exit(1);
+}
+client.login(TOKEN);

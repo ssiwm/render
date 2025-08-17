@@ -1,23 +1,21 @@
 {
-  "name": "sgservers-discord-bot",
+  "name": "render-discord-bot",
   "version": "1.0.0",
+  "description": "Discord bot with Qdrant KB for ARK servers (Render.com ready)",
   "type": "module",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "build": "echo nothing to build"
-  },
   "engines": {
     "node": ">=18 <23"
   },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
-    "discord.js": "^14.15.3",
-    "dotenv": "^16.4.5",
+    "discord.js": "^14.16.3",
     "express": "^4.19.2",
-    "gamedig": "^5.3.1",
-    "@qdrant/js-client-rest": "^1.15.0",
-    "googleapis": "^156.0.0",
-    "openai": "^4.52.0"
+    "dotenv": "^16.4.5",
+    "gamedig": "^4.0.6",
+    "@qdrant/js-client-rest": "^1.7.0",
+    "openai": "^4.60.1",
+    "axios": "^1.7.3"
   }
 }
-
