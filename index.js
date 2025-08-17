@@ -21,6 +21,11 @@ import { google } from 'googleapis';
 // SyntaxError in Node ESM.
 import * as Gamedig from 'gamedig';
 
+// Import knowledge base helpers. These will be used to initialize
+// the Qdrant vector store and perform KB operations (add/search docs).
+// When Qdrant is not configured, these functions will gracefully noop.
+import { kbReady, kbAddDoc, kbSearch } from './kb/kb.js';
+
 /*
  * SGServers Discord Bot
  *
@@ -58,15 +63,17 @@ async function safeReply(interaction, content, ephemeral = true) {
 
 // ========= OpenAI =========
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-async function askLLM(model, system, user) {
+async function askLLM(model, system, user, messages = null) {
+  // If messages are provided, use them directly; otherwise build from system/user.
+  const payloadMessages = messages || [
+    { role: 'system', content: system },
+    { role: 'user', content: user }
+  ];
   const r = await openai.chat.completions.create({
     model,
     temperature: 0.4,
     max_tokens: 600,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: user }
-    ]
+    messages: payloadMessages
   });
   return { text: r.choices?.[0]?.message?.content?.trim() || 'No response.', usage: r.usage };
 }
@@ -364,6 +371,27 @@ const commands = [
         .setDescription('Number of messages to retrieve (1-50, defaults to 10)')
         .setRequired(false)
     )
+
+  // Knowledge base commands
+  , new SlashCommandBuilder()
+    .setName('kb-add')
+    .setDescription('Add a knowledge entry to the vector KB.')
+    .addStringOption(o => o.setName('title').setDescription('Title').setRequired(true))
+    .addStringOption(o => o.setName('content').setDescription('Content').setRequired(true))
+  , new SlashCommandBuilder()
+    .setName('kb-search')
+    .setDescription('Search the knowledge base (preview).')
+    .addStringOption(o => o.setName('query').setDescription('What to search for').setRequired(true))
+  , new SlashCommandBuilder()
+    .setName('kb-import-pins')
+    .setDescription('Import pinned messages from a channel into KB.')
+    .addChannelOption(o =>
+      o
+        .setName('channel')
+        .setDescription('Channel')
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildText)
+    )
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -379,6 +407,15 @@ client.once('ready', async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   try { await registerCommands(); } catch (e) { console.error('Register commands', e); }
   try { startAutoStatus(); } catch (e) { console.error('auto-status', e); }
+
+  // Initialize the vector knowledge base. When no Qdrant URL/API key are provided,
+  // the KB functions will noop and return false. We log the result for clarity.
+  try {
+    const ok = await kbReady();
+    console.log(ok ? '📚 KB (Qdrant) ready.' : '📚 KB disabled (no QDRANT_URL).');
+  } catch (e) {
+    console.error('KB init', e);
+  }
 });
 
 // ========= Interaction handler =========
@@ -485,6 +522,55 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: '⚠️ Failed to fetch messages (check permissions and intents).', ephemeral: true });
       }
     }
+    // kb-add: add a document to the knowledge base
+    if (interaction.commandName === 'kb-add') {
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
+        return interaction.reply({ content: '⛔ Admin only.', ephemeral: true });
+      }
+      const title = interaction.options.getString('title', true);
+      const content = interaction.options.getString('content', true);
+      await interaction.deferReply({ ephemeral: true });
+      const r = await kbAddDoc({ title, text: content, source: 'manual', lang: 'en' });
+      if (!r.ok) return interaction.editReply('❌ KB not configured (Qdrant).');
+      return interaction.editReply(`✅ Added to KB: **${title}** (${r.chunks} chunks)`);
+    }
+
+    // kb-search: search the knowledge base
+    if (interaction.commandName === 'kb-search') {
+      const q = interaction.options.getString('query', true);
+      await interaction.deferReply({ ephemeral: true });
+      const hits = await kbSearch(q, 5);
+      if (!hits.length) return interaction.editReply('No KB matches.');
+      const lines = hits.map((h, i) => `**${i + 1}. ${h.title}** [${(h.score * 100) | 0}%]\n${h.text.slice(0, 300)}${h.text.length > 300 ? '…' : ''}`);
+      return interaction.editReply(lines.join('\n\n'));
+    }
+
+    // kb-import-pins: import pinned messages from a channel into the KB
+    if (interaction.commandName === 'kb-import-pins') {
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
+        return interaction.reply({ content: '⛔ Admin only.', ephemeral: true });
+      }
+      const channel = interaction.options.getChannel('channel', true);
+      await interaction.deferReply({ ephemeral: true });
+      try {
+        const pins = await channel.messages.fetchPinned();
+        if (!pins.size) return interaction.editReply('No pinned messages.');
+        let added = 0;
+        for (const [, msg] of pins) {
+          const title = `${channel.name} pin (${msg.id})`;
+          const text = `Author: ${msg.author?.username || 'unknown'}\nDate: ${msg.createdAt?.toISOString?.() || ''}\n\n${msg.content || ''}`;
+          const res = await kbAddDoc({ title, text, source: `pin:#${channel.name}`, lang: 'en' });
+          if (res.ok) added += res.chunks;
+        }
+        return interaction.editReply(`✅ Imported pins from #${channel.name}. Chunks: ${added}`);
+      } catch (e) {
+        console.error('kb-import-pins', e);
+        return interaction.editReply('❌ Failed to import pins.');
+      }
+    }
+
     // ask / ask-pro
     if (interaction.commandName === 'ask' || interaction.commandName === 'ask-pro') {
       const isPro = interaction.commandName === 'ask-pro';
@@ -507,16 +593,44 @@ client.on('interactionCreate', async (interaction) => {
       }
       await interaction.deferReply();
       try {
-        const { text, usage } = await askLLM(model, system, msg);
+        // Perform a knowledge-base search for context
+        const hits = await kbSearch(msg, 5);
+        const context = hits
+          .map((d, i) => `#${i + 1} ${d.title} (s=${d.score !== undefined ? d.score.toFixed(2) : '0.00'}, src=${d.source})\n${d.text}`)
+          .join('\n\n');
+        // Build chat messages with explicit rules and context
+        const messages = [
+          {
+            role: 'system',
+            content: `${system}\n\nRULES:\n- Answer ONLY using provided Context.\n- If Context lacks the answer, say you don't know and suggest /status or #announcements.\n- Be concise.`
+          },
+          {
+            role: 'user',
+            content: `Context:\n${context || '(no context)'}\n\nQuestion:\n${msg}`
+          }
+        ];
+        const { text, usage } = await askLLM(model, null, null, messages);
         consume(interaction.user.id, isPro, isOwnerHelper);
         await logUsage({ client, ctx: interaction, command: interaction.commandName, model, usage, elevated: isPro });
         return interaction.editReply(text);
       } catch (e) {
         console.error('ask', e);
         if (isBillingInactiveError(e)) {
-          return safeReply(interaction, lang === 'pl' ? '⚠️ Nasza subskrypcja OpenAI jest nieaktywna. Spróbuj ponownie później.' : '⚠️ Our OpenAI subscription is inactive. Please try again later.', true);
+          return safeReply(
+            interaction,
+            lang === 'pl'
+              ? '⚠️ Nasza subskrypcja OpenAI jest nieaktywna. Spróbuj ponownie później.'
+              : '⚠️ Our OpenAI subscription is inactive. Please try again later.',
+            true
+          );
         }
-        return safeReply(interaction, lang === 'pl' ? '⚠️ Wystąpił błąd podczas przetwarzania twojego zapytania.' : '⚠️ An error occurred while processing your request.', true);
+        return safeReply(
+          interaction,
+          lang === 'pl'
+            ? '⚠️ Wystąpił błąd podczas przetwarzania twojego zapytania.'
+            : '⚠️ An error occurred while processing your request.',
+          true
+        );
       }
     }
   } catch (e) {
