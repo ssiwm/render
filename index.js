@@ -1,4 +1,3 @@
-
 // index.js — Open AI Bot (Discord) with Qdrant KB
 // - Safer interaction handling (ack/respond) to avoid 10062 / 40060
 // - Reduced memory footprint via cache limits & sweepers

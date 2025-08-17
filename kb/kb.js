@@ -1,5 +1,4 @@
 // Optional replacement for axios-based helpers: uses global fetch (Node 18+)
-// Place as kb/kb.js if you want to drop axios from your project.
 export async function httpGetJson(url, headers = {}) {
   const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
