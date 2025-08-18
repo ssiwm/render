@@ -266,19 +266,54 @@ const commands = [
 // Rejestracja komend po ready — z dynamicznym appId
 client.once('ready', async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
+
+  // ZAWSZE bierzemy appId z tokena – eliminuje 10002
+  const appId = client.application?.id;
+  console.log(`🆔 Application ID (from token): ${appId}`);
+
+  // pomocny link zaproszenia właściwego bota
+  const invite = `https://discord.com/api/oauth2/authorize?client_id=${appId}&permissions=274877975552&scope=bot%20applications.commands`;
+  console.log(`🔗 Invite: ${invite}`);
+
+  // ostrzeż, jeśli w env jest stare CLIENT_ID (żeby nie mieszało):
+  if (process.env.DISCORD_CLIENT_ID && process.env.DISCORD_CLIENT_ID !== appId) {
+    console.warn(`⚠️ DISCORD_CLIENT_ID env (${process.env.DISCORD_CLIENT_ID}) != application.id (${appId}). Ignoruję env.`);
+  }
+
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+
   try {
-    const rest = new REST({ version: '10' }).setToken(TOKEN);
-    const appId = CLIENT_ID || client.application?.id; // dynamic
-    if (!appId) {
-      console.error('Could not determine application ID.');
-      return;
+    // Opcjonalny purge (jednorazowo ustaw env PURGE_COMMANDS=1)
+    if (process.env.PURGE_COMMANDS === '1') {
+      await rest.put(Routes.applicationCommands(appId), { body: [] });
+      console.log('🧹 Purged ALL global commands');
     }
+
+    // Global (propagacja może trwać), ale:
     await rest.put(Routes.applicationCommands(appId), { body: commands });
     console.log('✅ Slash commands registered globally.');
   } catch (e) {
-    console.error('Failed to register slash commands:', e);
+    console.error('Global register failed:', e);
+  }
+
+  // Fallback: natychmiastowa rejestracja w każdej gildii, gdzie jest bot (działa od razu)
+  try {
+    const guilds = await client.guilds.fetch();
+    await Promise.all(
+      guilds.map(async g => {
+        try {
+          await rest.put(Routes.applicationGuildCommands(appId, g.id), { body: commands });
+          console.log(`✅ Guild commands registered in ${g.id}`);
+        } catch (e) {
+          console.error(`Guild register failed in ${g.id}:`, e?.code || e?.message || e);
+        }
+      })
+    );
+  } catch (e) {
+    console.error('Guild fetch/register fallback failed:', e);
   }
 });
+
 
 // --------------------------- Interaction handler ---------------------------
 
