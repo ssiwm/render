@@ -478,7 +478,12 @@ client.on('interactionCreate', async (interaction) => {
       if (isPro && !canPro) {
         return respond(interaction, { content: '⛔ /ask-pro requires a pro role.' });
       }
-      const question = interaction.options.getString('question', true);
+      let question = interaction.options.getString('question', false);
+	  if (!question) {
+      // jeśli UI jeszcze nie wymusza pola, poproś o poprawną składnię
+      return respond(interaction, { content: 'Podaj pytanie: użyj **/ask question:"twoje pytanie"**' });
+      }
+
 
       // KB context
       let contexts = [];
