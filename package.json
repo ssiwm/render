@@ -1,5 +1,5 @@
- {
-  "name": "sgservers-bot",
+{
+  "name": "render-discord-bot",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -10,11 +10,12 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js": "^14.15.3",
+    "@qdrant/js-client-rest": "^1.7.0",
+    "axios": "^1.7.3",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "gamedig": "^4.0.9",
-    "@qdrant/js-client-rest": "^1.9.0",
-    "openai": "^4.52.2",
-    "axios": "^1.7.7"
+    "gamedig": "^4.0.6",
+    "openai": "^4.60.1"
   }
 }
